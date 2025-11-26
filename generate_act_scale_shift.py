@@ -97,7 +97,13 @@ def get_act_shifts(model, dataloader, num_samples=128):
 
 
 def build_model_and_tokenizer(model_name):
-    kwargs = {"torch_dtype": torch.float16, "device_map": "auto"}
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        load_dtype = torch.bfloat16
+    elif torch.cuda.is_available():
+        load_dtype = torch.float16
+    else:
+        load_dtype = torch.float32
+    kwargs = {"torch_dtype": load_dtype, "device_map": "auto"}
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     return model, tokenizer

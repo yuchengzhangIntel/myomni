@@ -45,8 +45,17 @@ net_choices = [
     "llava-llama-2-13b-chat-lightning-preview",
     "falcon-180b",
     "falcon-7b",
-    "mixtral-8x7b"
+    "mixtral-8x7b",
+    "Qwen1.5-MoE-A2.7B",
+    "Qwen1.5-MoE-A2.7B-Chat",
+    "qwen2-moe",
+    "qwen2_moe",
 ]
+
+
+def is_llama_like_model(net_name: str):
+    net_name = net_name.lower()
+    return "llama" in net_name or "mixtral" in net_name or "qwen2" in net_name or "qwen" in net_name
 
 
 @torch.no_grad()
@@ -64,7 +73,7 @@ def evaluate(lm, args, logger):
             lm.model.model.decoder.final_layer_norm.to(output_device)
             lm.model.lm_head.to(output_device)
 
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+        elif is_llama_like_model(args.net):
             map_layers_to_multi_gpus(lm.model.model.layers)
             input_device = lm.model.model.layers[0].device
             output_device = lm.model.model.layers[-1].device
@@ -85,7 +94,7 @@ def evaluate(lm, args, logger):
     else:
         if "opt" in args.net.lower():
             lm.model.model.decoder = lm.model.model.decoder.to(lm.device)
-        elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+        elif is_llama_like_model(args.net):
             lm.model = lm.model.to(lm.device)
         elif "falcon" in args.net.lower():
             lm.model.transformer = lm.model.transformer.to(lm.device)
@@ -120,7 +129,7 @@ def evaluate(lm, args, logger):
                 batch = testenc[:, (i * lm.seqlen) : ((i + 1) * lm.seqlen)].to(lm.device)
                 if "opt" in args.net.lower():
                     outputs = lm.model.model.decoder(batch)
-                elif "llama" in args.net.lower() or "mixtral" in args.net.lower():
+                elif is_llama_like_model(args.net):
                     outputs = lm.model.model(batch)
                 elif "falcon" in args.model:
                     outputs = lm.model.transformer(batch)
@@ -207,6 +216,10 @@ def main():
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--wbits", type=int, default=4)
     parser.add_argument("--abits", type=int, default=16)
+    parser.add_argument("--attn_wbits", type=int, default=None)
+    parser.add_argument("--ffn_wbits", type=int, default=None)
+    parser.add_argument("--attn_abits", type=int, default=None)
+    parser.add_argument("--ffn_abits", type=int, default=None)
     parser.add_argument("--group_size", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--let_lr", type=float, default=5e-3)
@@ -243,7 +256,17 @@ def main():
     if args.epochs > 0:
         assert args.lwc or args.let
         
-    if (args.wbits<16 and args.wbits>=8) or (args.abits<16 and args.abits>=8):
+    if args.attn_wbits is None:
+        args.attn_wbits = args.wbits
+    if args.ffn_wbits is None:
+        args.ffn_wbits = args.wbits
+    if args.attn_abits is None:
+        args.attn_abits = args.abits
+    if args.ffn_abits is None:
+        args.ffn_abits = args.abits
+
+    quant_bits = [args.attn_wbits, args.ffn_wbits, args.attn_abits, args.ffn_abits]
+    if any(8 <= bits < 16 for bits in quant_bits):
         args.deactive_amp = True
 
     # init logger
@@ -270,8 +293,8 @@ def main():
 
     
 
-    args.weight_quant_params = {
-        "n_bits": args.wbits,
+    args.attn_weight_quant_params = {
+        "n_bits": args.attn_wbits,
         "per_channel_axes": [0],
         "symmetric": args.symmetric,
         "dynamic_method": args.w_dynamic_method,
@@ -279,26 +302,43 @@ def main():
         "lwc":args.lwc,
         "disable_zero_point": args.disable_zero_point
     }
-    args.act_quant_params = {
-        "n_bits":  args.abits,
+    args.ffn_weight_quant_params = {
+        "n_bits": args.ffn_wbits,
+        "per_channel_axes": [0],
+        "symmetric": args.symmetric,
+        "dynamic_method": args.w_dynamic_method,
+        "group_size": args.group_size,
+        "lwc":args.lwc,
+        "disable_zero_point": args.disable_zero_point
+    }
+    args.attn_act_quant_params = {
+        "n_bits":  args.attn_abits,
         "per_channel_axes": [],
         "symmetric": False,
         "dynamic_method": args.a_dynamic_method,
     }
+    args.ffn_act_quant_params = {
+        "n_bits":  args.ffn_abits,
+        "per_channel_axes": [],
+        "symmetric": False,
+        "dynamic_method": args.a_dynamic_method,
+    }
+    args.weight_quant_params = args.ffn_weight_quant_params
+    args.act_quant_params = args.ffn_act_quant_params
     args.q_quant_params = {
-        "n_bits": args.abits,
+        "n_bits": args.attn_abits,
         "per_channel_axes": [],
         "symmetric": False,
         "dynamic_method": args.a_dynamic_method,
     }
     args.k_quant_params = {
-        "n_bits": args.abits,
+        "n_bits": args.attn_abits,
         "per_channel_axes": [],
         "symmetric": False,
         "dynamic_method": args.a_dynamic_method,
     }
     args.v_quant_params = {
-        "n_bits": args.abits,
+        "n_bits": args.attn_abits,
         "per_channel_axes": [],
         "symmetric": False,
         "dynamic_method": args.a_dynamic_method,
@@ -320,7 +360,7 @@ def main():
         args.act_shifts = f'./act_shifts/{args.net}.pt'
 
     # quantization
-    if args.wbits < 16 or args.abits <16:
+    if min(quant_bits) < 16:
         logger.info("=== start quantization ===")
         tick = time.time()     
         # load calibration dataset

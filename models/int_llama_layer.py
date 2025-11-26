@@ -15,6 +15,16 @@ import copy
 from models.transformation import *
 
 
+def _get_quant_params(args, part: str):
+    if part == "attn":
+        weight_params = getattr(args, "attn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "attn_act_quant_params", args.act_quant_params)
+    else:
+        weight_params = getattr(args, "ffn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "ffn_act_quant_params", args.act_quant_params)
+    return weight_params, act_params
+
+
 
 
 class QuantLlamaMLP(nn.Module):
@@ -27,18 +37,19 @@ class QuantLlamaMLP(nn.Module):
         args=None,
     ):
         super().__init__()
+        ffn_weight_quant_params, ffn_act_quant_params = _get_quant_params(args, "ffn")
         # self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         # self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         # self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.gate_proj = QuantLinear(org_module.gate_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                                           ffn_weight_quant_params,
+                                           ffn_act_quant_params)
         self.down_proj = QuantLinear(org_module.down_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                                           ffn_weight_quant_params,
+                                           ffn_act_quant_params)
         self.up_proj = QuantLinear(org_module.up_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                                           ffn_weight_quant_params,
+                                           ffn_act_quant_params)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -53,6 +64,7 @@ class QuantLlamaAttention(nn.Module):
                  config: LlamaConfig,
                  args=None):
         super().__init__()
+        attn_weight_quant_params, attn_act_quant_params = _get_quant_params(args, "attn")
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -71,21 +83,21 @@ class QuantLlamaAttention(nn.Module):
 
         self.k_proj = QuantLinear(
             org_module.k_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.o_proj = QuantLinear(
-            org_module.o_proj, args.weight_quant_params, args.act_quant_params
+            org_module.o_proj, attn_weight_quant_params, attn_act_quant_params
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.matmul
@@ -98,6 +110,15 @@ class QuantLlamaAttention(nn.Module):
         self.use_act_quant = False
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+            def _get_quant_params(args, part: str):
+                if part == "attn":
+                    weight_params = getattr(args, "attn_weight_quant_params", args.weight_quant_params)
+                    act_params = getattr(args, "attn_act_quant_params", args.act_quant_params)
+                else:
+                    weight_params = getattr(args, "ffn_weight_quant_params", args.weight_quant_params)
+                    act_params = getattr(args, "ffn_act_quant_params", args.act_quant_params)
+                return weight_params, act_params
+
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(
@@ -109,18 +130,15 @@ class QuantLlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        # query_states = self.q_proj(hidden_states)
         # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+                                                       ffn_weight_quant_params,
+                                                       ffn_act_quant_params)
         key_states =self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
+                                                       ffn_weight_quant_params,
+                                                       ffn_act_quant_params)
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+                                                       ffn_weight_quant_params,
+                                                       ffn_act_quant_params)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -153,21 +171,21 @@ class QuantLlamaAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+                        attn_weight_quant_params,
+                        attn_act_quant_params,
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = self.pv_matmul.quant_x1(attn_weights)
-        value_states = self.pv_matmul.quant_x2(value_states)
+                        attn_weight_quant_params,
+                        attn_act_quant_params,
         attn_output = self.pv_matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                        attn_weight_quant_params,
+                        attn_act_quant_params,
                 f" {attn_output.size()}"
             )
-
+                        org_module.o_proj, attn_weight_quant_params, attn_act_quant_params
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 

@@ -14,16 +14,27 @@ from models.transformation import *
 from quantize.omni_norm import OmniLayerNorm
 
 
+def _get_quant_params(args, part: str):
+    if part == "attn":
+        weight_params = getattr(args, "attn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "attn_act_quant_params", args.act_quant_params)
+    else:
+        weight_params = getattr(args, "ffn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "ffn_act_quant_params", args.act_quant_params)
+    return weight_params, act_params
+
+
 
 
     
 class QuantFalconMLP(nn.Module):
     def __init__(self, org_module: nn.Module,args=None):
         super().__init__()
+        ffn_weight_quant_params, ffn_act_quant_params = _get_quant_params(args, "ffn")
 
-        self.dense_h_to_4h = QuantLinear(org_module.dense_h_to_4h,args.weight_quant_params,args.act_quant_params)
+        self.dense_h_to_4h = QuantLinear(org_module.dense_h_to_4h,ffn_weight_quant_params,ffn_act_quant_params)
         self.act = nn.GELU()
-        self.dense_4h_to_h = QuantLinear(org_module.dense_4h_to_h,args.weight_quant_params,args.act_quant_params)
+        self.dense_4h_to_h = QuantLinear(org_module.dense_4h_to_h,ffn_weight_quant_params,ffn_act_quant_params)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act(self.dense_h_to_4h(x))
@@ -35,6 +46,7 @@ class QuantFalconMLP(nn.Module):
 class QuantFalconAttention(nn.Module):
     def __init__(self,  config: FalconConfig, org_module: nn.Module, args=None):
         super().__init__()
+        attn_weight_quant_params, attn_act_quant_params = _get_quant_params(args, "attn")
 
         self.config = config
         self.hidden_size = config.hidden_size
@@ -54,10 +66,10 @@ class QuantFalconAttention(nn.Module):
         # Layer-wise attention scaling
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         self.beta = self.inv_norm_factor
-        self.query_key_value = QuantLinear(org_module.query_key_value,args.weight_quant_params,args.act_quant_params)
+        self.query_key_value = QuantLinear(org_module.query_key_value,attn_weight_quant_params,attn_act_quant_params)
         self.new_decoder_architecture = config.new_decoder_architecture
         self.multi_query = config.multi_query
-        self.dense =QuantLinear(org_module.dense,args.weight_quant_params,args.act_quant_params)
+        self.dense =QuantLinear(org_module.dense,attn_weight_quant_params,attn_act_quant_params)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.num_kv_heads = config.num_kv_heads if (self.new_decoder_architecture or not self.multi_query) else 1
 

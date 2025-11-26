@@ -11,6 +11,16 @@ from models.models_utils import truncate_number
 from models.transformation import *
 
 
+def _get_quant_params(args, part: str):
+    if part == "attn":
+        weight_params = getattr(args, "attn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "attn_act_quant_params", args.act_quant_params)
+    else:
+        weight_params = getattr(args, "ffn_weight_quant_params", args.weight_quant_params)
+        act_params = getattr(args, "ffn_act_quant_params", args.act_quant_params)
+    return weight_params, act_params
+
+
 
 
 class QuantOPTAttention(nn.Module):
@@ -28,6 +38,7 @@ class QuantOPTAttention(nn.Module):
         disable_act_quant=False,
     ):
         super().__init__()
+        attn_weight_quant_params, attn_act_quant_params = _get_quant_params(args, "attn")
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
@@ -45,21 +56,21 @@ class QuantOPTAttention(nn.Module):
         # input is quantized by LayerNorm, set disable_input_quant=True
         self.k_proj = QuantLinear(
             org_module.k_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
-            args.weight_quant_params,
-            args.act_quant_params,
+            attn_weight_quant_params,
+            attn_act_quant_params,
         )
         self.out_proj = QuantLinear(
-            org_module.out_proj, args.weight_quant_params, args.act_quant_params
+            org_module.out_proj, attn_weight_quant_params, attn_act_quant_params
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.bmm
@@ -160,10 +171,11 @@ class QuantOPTAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
-        if attn_weights.dtype == torch.float16:
+        if attn_weights.dtype == torch.float16 or attn_weights.dtype == torch.bfloat16:
+            org_dtype = attn_weights.dtype
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32
-            ).to(torch.float16)
+            ).to(org_dtype)
         else:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -235,6 +247,7 @@ class QuantOPTDecoderLayer(nn.Module):
         args,
     ):
         super().__init__()
+        ffn_weight_quant_params, ffn_act_quant_params = _get_quant_params(args, "ffn")
         self.embed_dim = config.hidden_size
         self.self_attn = QuantOPTAttention(
             org_module=ori_layer.self_attn,
@@ -252,13 +265,13 @@ class QuantOPTDecoderLayer(nn.Module):
         )
         self.fc1 = QuantLinear(
             ori_layer.fc1,
-            weight_quant_params=args.weight_quant_params,
-            act_quant_params=args.act_quant_params,
+            weight_quant_params=ffn_weight_quant_params,
+            act_quant_params=ffn_act_quant_params,
         )
         self.fc2 = QuantLinear(
             ori_layer.fc2,
-            weight_quant_params=args.weight_quant_params,
-            act_quant_params=args.act_quant_params,
+            weight_quant_params=ffn_weight_quant_params,
+            act_quant_params=ffn_act_quant_params,
         )
         self.final_layer_norm = OmniLayerNorm(
             ori_layer.final_layer_norm
