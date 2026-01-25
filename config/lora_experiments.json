@@ -1,0 +1,93 @@
+{
+  "global": {
+    "model_path": "/PATH/TO/Mixtral-8x7B-v0.1",
+    "net": "mixtral-8x7b",
+    "output_base_dir": "./experiments/lora_mixtral",
+    "cache_dir": "./cache",
+    "calib_dataset": "wikitext2",
+    "eval_ppl": true,
+    "tasks": "",
+    "real_quant": false,
+    "multigpu": false,
+    "attn_implementation": "eager"
+  },
+  "defaults": {
+    "epochs": 10,
+    "batch_size": 1,
+    "nsamples": 128,
+    "wbits": 4,
+    "abits": 16,
+    "group_size": 128,
+    "seed": 2,
+    "lwc": true,
+    "let": false,
+    "aug_loss": false,
+    "let_lr": 0.005,
+    "lwc_lr": 0.01
+  },
+  "experiments": [
+    {
+      "name": "lora_rank4_alpha8",
+      "lora_rank": 4,
+      "lora_alpha": 8.0,
+      "lora_lr": 0.005
+    },
+    {
+      "name": "lora_rank8_alpha16",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005
+    },
+    {
+      "name": "lora_rank16_alpha32",
+      "lora_rank": 16,
+      "lora_alpha": 32.0,
+      "lora_lr": 0.005
+    },
+    {
+      "name": "lora_rank8_alpha16_lr1e-3",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.001
+    },
+    {
+      "name": "lora_rank8_alpha16_lr1e-2",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.01
+    },
+    {
+      "name": "lora_rank8_alpha16_epochs20",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005,
+      "epochs": 20
+    },
+    {
+      "name": "lora_rank8_with_let",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005,
+      "let": true
+    },
+    {
+      "name": "lora_rank8_aug_loss",
+      "lora_rank": 8,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005,
+      "aug_loss": true
+    },
+    {
+      "name": "lora_rank4_alpha16_high_ratio",
+      "lora_rank": 4,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005
+    },
+    {
+      "name": "lora_rank16_alpha16_low_ratio",
+      "lora_rank": 16,
+      "lora_alpha": 16.0,
+      "lora_lr": 0.005
+    }
+  ]
+}

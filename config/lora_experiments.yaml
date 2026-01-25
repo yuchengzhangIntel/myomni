@@ -1,0 +1,108 @@
+# LoRA Experiments Configuration for Mixtral Models
+# This file defines multiple experiment configurations for batch training and evaluation
+
+# Global settings shared across all experiments
+global:
+  # Path to the Mixtral model (local path or HuggingFace model name)
+  model_path: "/PATH/TO/Mixtral-8x7B-v0.1"
+  # Network identifier
+  net: "mixtral-8x7b"
+  # Base directory for all experiment outputs
+  output_base_dir: "./experiments/lora_mixtral"
+  # Cache directory for datasets
+  cache_dir: "./cache"
+  # Calibration dataset
+  calib_dataset: "wikitext2"
+  # Whether to evaluate perplexity
+  eval_ppl: true
+  # Additional evaluation tasks (comma-separated, e.g., "lambada_openai,hellaswag")
+  tasks: ""
+  # Whether to use real quantization
+  real_quant: false
+  # Use multiple GPUs for evaluation
+  multigpu: false
+  # Attention implementation
+  attn_implementation: "eager"
+  # Paths to activation scales/shifts (optional, will use defaults if not specified)
+  # act_scales: "./act_scales/mixtral-8x7b.pt"
+  # act_shifts: "./act_shifts/mixtral-8x7b.pt"
+
+# Default values for experiments (can be overridden per experiment)
+defaults:
+  epochs: 10
+  batch_size: 1
+  nsamples: 128
+  wbits: 4
+  abits: 16
+  group_size: 128
+  seed: 2
+  lwc: true
+  let: false
+  aug_loss: false
+  let_lr: 0.005
+  lwc_lr: 0.01
+
+# List of experiments to run
+experiments:
+  # Experiment 1: Baseline with small LoRA rank
+  - name: "lora_rank4_alpha8"
+    lora_rank: 4
+    lora_alpha: 8.0
+    lora_lr: 0.005
+
+  # Experiment 2: Medium rank with matched alpha
+  - name: "lora_rank8_alpha16"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.005
+
+  # Experiment 3: Larger rank
+  - name: "lora_rank16_alpha32"
+    lora_rank: 16
+    lora_alpha: 32.0
+    lora_lr: 0.005
+
+  # Experiment 4: Test different learning rate
+  - name: "lora_rank8_alpha16_lr1e-3"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.001
+
+  # Experiment 5: Higher learning rate
+  - name: "lora_rank8_alpha16_lr1e-2"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.01
+
+  # Experiment 6: More epochs
+  - name: "lora_rank8_alpha16_epochs20"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.005
+    epochs: 20
+
+  # Experiment 7: Test with LET (Learnable Equivalent Transformation)
+  - name: "lora_rank8_with_let"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.005
+    let: true
+
+  # Experiment 8: Test with augmented loss
+  - name: "lora_rank8_aug_loss"
+    lora_rank: 8
+    lora_alpha: 16.0
+    lora_lr: 0.005
+    aug_loss: true
+
+  # Experiment 9: Higher ratio (alpha/rank)
+  - name: "lora_rank4_alpha16_high_ratio"
+    lora_rank: 4
+    lora_alpha: 16.0
+    lora_lr: 0.005
+
+  # Experiment 10: Lower ratio
+  - name: "lora_rank16_alpha16_low_ratio"
+    lora_rank: 16
+    lora_alpha: 16.0
+    lora_lr: 0.005

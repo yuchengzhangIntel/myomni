@@ -214,6 +214,8 @@ def main():
     parser.add_argument("--lora_lr", type=float, default=5e-3, help="learning rate for LoRA parameters in router layers")
     parser.add_argument("--lora_rank", type=int, default=8, help="rank for LoRA adapter in router layers")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="alpha scaling factor for LoRA adapter")
+    parser.add_argument("--lora_checkpoint_path", type=str, default=None, help="path to LoRA checkpoint for evaluation")
+    parser.add_argument("--init_lora", default=False, action="store_true", help="initialize LoRA adapters without pretrained weights")
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--let",default=False, action="store_true",help="activate learnable equivalent transformation")
