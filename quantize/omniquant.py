@@ -334,6 +334,9 @@ def omniquant(
                 qlayer = wrap_qwen2moe_layer_for_router_output(qlayer)
                 qlayer = qlayer.to(dev)
                 
+                # Get seqlen for shape handling
+                seqlen = lm.seqlen
+                
                 # Calculate initial expert shift (before calibration)
                 with torch.no_grad():
                     initial_shift_any_sum = 0.0
@@ -351,7 +354,8 @@ def omniquant(
                             shift_metrics = compute_expert_shift_detailed(
                                 router_logits, 
                                 teacher_indices[j:j+1], 
-                                k_routing
+                                k_routing,
+                                seqlen=seqlen
                             )
                             initial_shift_any_sum += shift_metrics["shift_any"]
                             initial_shift_half_sum += shift_metrics["shift_half"]
@@ -389,6 +393,7 @@ def omniquant(
                     
                     for epoch in range(router_epochs):
                         epoch_loss = 0.0
+                        num_valid_samples = 0
                         for j in range(args.nsamples):
                             router_optimizer.zero_grad()
                             
@@ -406,15 +411,20 @@ def omniquant(
                                 loss = compute_topk_mse_loss(
                                     router_logits,
                                     teacher_probs[j:j+1],
-                                    teacher_indices[j:j+1]
+                                    teacher_indices[j:j+1],
+                                    seqlen=seqlen
                                 )
                                 
                                 loss.backward()
                                 router_optimizer.step()
                                 epoch_loss += loss.item()
+                                num_valid_samples += 1
                         
-                        avg_loss = epoch_loss / args.nsamples
-                        logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}: TopK-MSE Loss = {avg_loss:.6f}")
+                        if num_valid_samples > 0:
+                            avg_loss = epoch_loss / num_valid_samples
+                        else:
+                            avg_loss = 0.0
+                        logger.info(f"[Router Calibration] Layer {i} Epoch {epoch}/{router_epochs-1}: TopK-MSE Loss = {avg_loss:.6f}")
                         
                         # WandB logging for router calibration
                         if wandb is not None:
@@ -449,7 +459,8 @@ def omniquant(
                             shift_metrics = compute_expert_shift_detailed(
                                 router_logits,
                                 teacher_indices[j:j+1],
-                                k_routing
+                                k_routing,
+                                seqlen=seqlen
                             )
                             post_shift_any_sum += shift_metrics["shift_any"]
                             post_shift_half_sum += shift_metrics["shift_half"]
@@ -691,6 +702,7 @@ def omniquant(
         # =================================================================
         if is_qwen_moe and calibrate_router and cached_router_labels is not None:
             teacher_probs, teacher_indices = cached_router_labels
+            seqlen = lm.seqlen  # Get seqlen again for this scope
             
             # Wrap again for final check if needed
             wrapped_qlayer = wrap_qwen2moe_layer_for_router_output(qlayer)
@@ -712,7 +724,8 @@ def omniquant(
                         shift_metrics = compute_expert_shift_detailed(
                             router_logits,
                             teacher_indices[j:j+1],
-                            k_routing
+                            k_routing,
+                            seqlen=seqlen
                         )
                         final_shift_any_sum += shift_metrics["shift_any"]
                         final_shift_half_sum += shift_metrics["shift_half"]

@@ -116,6 +116,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     
     Returns:
         (values_tensor, indices_tensor) on GPU device
+        Shape: [nsamples, seqlen, topk] for both tensors
     """
     if not hasattr(layer, 'mlp') or not hasattr(layer.mlp, 'gate'):
         return None
@@ -124,8 +125,15 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
     all_indices = []
     captured_data = []
     
+    seqlen = inps.shape[1]  # Get sequence length from inputs
+    
     def hook_fn(module, input, output):
         logits = output.detach()
+        # Qwen2MoE router gate output shape: [batch*seq_len, num_experts] (2D)
+        # We need to reshape to [batch, seq_len, num_experts] if necessary
+        if logits.dim() == 2:
+            # Reshape from [batch*seq_len, num_experts] to [1, seq_len, num_experts]
+            logits = logits.view(1, seqlen, -1)
         probs = torch.softmax(logits, dim=-1)
         values, indices = torch.topk(probs, k=topk, dim=-1)
         captured_data.append((values, indices))
@@ -138,8 +146,8 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
         with torch.cuda.amp.autocast():
             _ = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)
         if captured_data:
-            all_values.append(captured_data[0][0])
-            all_indices.append(captured_data[0][1])
+            all_values.append(captured_data[0][0])  # [1, seqlen, topk]
+            all_indices.append(captured_data[0][1])  # [1, seqlen, topk]
     
     hook.remove()
     
@@ -188,14 +196,17 @@ def compute_expert_shift(student_logits, teacher_indices, k_routing):
     return mismatch_rate
 
 
-def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing):
+def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing, seqlen=None):
     """
     Compute detailed expert shift metrics based on three levels of change.
     
     Args:
-        student_logits: Router logits from student model [batch, seq_len, num_experts]
-        teacher_indices: Top-k expert indices from teacher [batch, seq_len, topk_cached]
+        student_logits: Router logits from student model 
+                       Shape: [batch, seq_len, num_experts] or [batch*seq_len, num_experts]
+        teacher_indices: Top-k expert indices from teacher 
+                        Shape: [batch, seq_len, topk_cached]
         k_routing: Number of experts actually used for routing (may be <= topk_cached)
+        seqlen: Sequence length (required if student_logits is 2D)
     
     Returns:
         dict with:
@@ -203,6 +214,18 @@ def compute_expert_shift_detailed(student_logits, teacher_indices, k_routing):
             - shift_half: Rate of tokens where at least half of experts changed
             - shift_all: Rate of tokens where all experts changed
     """
+    # Handle 2D student_logits from Qwen2MoE router
+    if student_logits.dim() == 2:
+        if seqlen is None:
+            # Try to infer from teacher_indices
+            if teacher_indices.dim() == 3:
+                seqlen = teacher_indices.shape[1]
+            else:
+                raise ValueError("seqlen must be provided when student_logits is 2D")
+        # Reshape from [batch*seq_len, num_experts] to [batch, seq_len, num_experts]
+        batch_size = student_logits.shape[0] // seqlen
+        student_logits = student_logits.view(batch_size, seqlen, -1)
+    
     student_probs = torch.softmax(student_logits, dim=-1)
     _, student_indices = torch.topk(student_probs, k=k_routing, dim=-1)  # [batch, seq, k_routing]
     
@@ -358,18 +381,30 @@ def wrap_qwen2moe_layer_for_router_output(qlayer):
 # =============================================================================
 # Router Calibration Loss Functions
 # =============================================================================
-def compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices):
+def compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices, seqlen=None):
     """
     Compute TopK-MSE loss for router calibration.
     
     Args:
-        student_logits: Router logits from student [batch, seq, num_experts]
+        student_logits: Router logits from student 
+                       Shape: [batch, seq, num_experts] or [batch*seq, num_experts]
         teacher_probs: Top-k probability values from teacher [batch, seq, topk]
         teacher_indices: Top-k expert indices from teacher [batch, seq, topk]
+        seqlen: Sequence length (required if student_logits is 2D)
     
     Returns:
         loss: MSE loss between gathered student probs and teacher probs
     """
+    # Handle 2D student_logits from Qwen2MoE router
+    if student_logits.dim() == 2:
+        if seqlen is None:
+            if teacher_probs.dim() == 3:
+                seqlen = teacher_probs.shape[1]
+            else:
+                raise ValueError("seqlen must be provided when student_logits is 2D")
+        batch_size = student_logits.shape[0] // seqlen
+        student_logits = student_logits.view(batch_size, seqlen, -1)
+    
     # Compute student probabilities
     student_probs = torch.softmax(student_logits, dim=-1)  # [batch, seq, num_experts]
     
