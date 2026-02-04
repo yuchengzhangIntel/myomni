@@ -431,7 +431,10 @@ def omniquant(
                                     teacher_indices[j:j+1],
                                     seqlen=seqlen
                                 )
-                                
+                                if not torch.isfinite(loss):
+                                    logger.warning(f"[Router Calibration] Layer {i}: Non-finite loss detected, skipping step.")
+                                    continue
+
                                 loss.backward()
                                 router_optimizer.step()
                                 epoch_loss += loss.item()
@@ -612,6 +615,7 @@ def omniquant(
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
+                nan_loss = False
                 for j in range(args.nsamples//args.batch_size):    
                     index = j * args.batch_size
                     # obtain output of quantization model
@@ -622,14 +626,18 @@ def omniquant(
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
                     if not math.isfinite(loss.item()):
-                        logger.info("Loss is NAN, stopping training")
-                        pdb.set_trace()
+                        logger.warning("Non-finite loss detected during gate training, stopping this layer's training.")
+                        nan_loss = True
+                        break
                         
                     loss_list.append(loss.detach().cpu())
                     optimizer.zero_grad()
                     # Use complete parameter list for gradient clipping
                     norm = loss_scaler(loss, optimizer, parameters=clip_parameters).cpu()
                     norm_list.append(norm.data)
+
+                if nan_loss:
+                    break
 
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()

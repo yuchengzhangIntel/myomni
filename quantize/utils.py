@@ -134,7 +134,7 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
         if logits.dim() == 2:
             # Reshape from [batch*seq_len, num_experts] to [1, seq_len, num_experts]
             logits = logits.view(1, seqlen, -1)
-        probs = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits.float(), dim=-1)
         values, indices = torch.topk(probs, k=topk, dim=-1)
         captured_data.append((values, indices))
     
@@ -413,15 +413,15 @@ def compute_topk_mse_loss(student_logits, teacher_probs, teacher_indices, seqlen
         batch_size = student_logits.shape[0] // seqlen
         student_logits = student_logits.view(batch_size, seqlen, -1)
     
-    # Compute student probabilities
-    student_probs = torch.softmax(student_logits, dim=-1)  # [batch, seq, num_experts]
+    # Compute student probabilities in float32 for stability
+    student_probs = torch.softmax(student_logits.float(), dim=-1)  # [batch, seq, num_experts]
     
     # Gather student probabilities at teacher's top-k indices
     # teacher_indices: [batch, seq, topk]
     gathered_student_probs = torch.gather(student_probs, dim=-1, index=teacher_indices)
     
     # Compute MSE loss
-    loss = F.mse_loss(gathered_student_probs, teacher_probs)
+    loss = F.mse_loss(gathered_student_probs, teacher_probs.float())
     
     return loss
 
