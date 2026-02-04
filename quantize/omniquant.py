@@ -407,6 +407,21 @@ def omniquant(
                     logger.warning(f"[Router Calibration] Layer {i}: Router gate module not found! Available modules: {[n for n, _ in qlayer.named_modules()][:20]}...")
                 
                 if router_gate_params:
+                    # Convert router gate parameters to float32 for stable training
+                    # Save original dtype and convert to float
+                    original_dtypes = {}
+                    for name, module in qlayer.named_modules():
+                        is_router_gate = (name.endswith(".gate") or name == "gate" or 
+                                          name.endswith("layer.mlp.gate") or name == "layer.mlp.gate" or
+                                          name == "mlp.gate")
+                        if is_router_gate:
+                            if hasattr(module, 'weight') and module.weight is not None:
+                                original_dtypes[f"{name}.weight"] = module.weight.dtype
+                                module.weight.data = module.weight.data.float()
+                            if hasattr(module, 'bias') and module.bias is not None:
+                                original_dtypes[f"{name}.bias"] = module.bias.dtype
+                                module.bias.data = module.bias.data.float()
+                    
                     router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
                     
                     for epoch in range(router_epochs):
@@ -415,20 +430,19 @@ def omniquant(
                         for j in range(args.nsamples):
                             router_optimizer.zero_grad()
                             
-                            # Forward with router logits
-                            with torch.cuda.amp.autocast():
-                                _, router_logits = qlayer(
-                                    quant_inps[j].unsqueeze(0),
-                                    attention_mask=attention_mask,
-                                    position_ids=position_ids,
-                                    output_router_logits=True
-                                )
+                            # Forward with router logits (no autocast for router calibration)
+                            _, router_logits = qlayer(
+                                quant_inps[j].unsqueeze(0).float(),  # Convert input to float
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                output_router_logits=True
+                            )
                             
                             if router_logits is not None:
                                 # Compute TopK-MSE loss
                                 loss = compute_topk_mse_loss(
-                                    router_logits,
-                                    teacher_probs[j:j+1],
+                                    router_logits.float(),
+                                    teacher_probs[j:j+1].float(),
                                     teacher_indices[j:j+1],
                                     seqlen=seqlen
                                 )
@@ -454,6 +468,19 @@ def omniquant(
                             global_step += 1
                     
                     del router_optimizer
+                    
+                    # Convert router gate parameters back to original dtype (float16)
+                    for name, module in qlayer.named_modules():
+                        is_router_gate = (name.endswith(".gate") or name == "gate" or 
+                                          name.endswith("layer.mlp.gate") or name == "layer.mlp.gate" or
+                                          name == "mlp.gate")
+                        if is_router_gate:
+                            if hasattr(module, 'weight') and module.weight is not None:
+                                orig_dtype = original_dtypes.get(f"{name}.weight", torch.float16)
+                                module.weight.data = module.weight.data.to(orig_dtype)
+                            if hasattr(module, 'bias') and module.bias is not None:
+                                orig_dtype = original_dtypes.get(f"{name}.bias", torch.float16)
+                                module.bias.data = module.bias.data.to(orig_dtype)
                 else:
                     logger.warning(f"[Router Calibration] Layer {i}: No router gate parameters found to train! Skipping calibration.")
                 
