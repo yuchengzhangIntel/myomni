@@ -280,6 +280,32 @@ def evaluate(lm, args, logger):
     else:
         raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
 
+    # === [Added] WandB Visualization Logic ===
+    if args.enable_wandb and len(results) > 0:
+        try:
+            import wandb
+
+            # 1. Standard Logging (Line charts/history)
+            wandb.log(results)
+
+            # 2. Bar Chart Visualization (Summary)
+            # Filter for numeric values only
+            table_data = [[k, v] for k, v in results.items() if isinstance(v, (int, float))]
+
+            # Create a WandB Table
+            table = wandb.Table(data=table_data, columns=["Task Name", "Metric Value"])
+
+            # Create and log the Bar Chart
+            wandb.log({
+                "final_evaluation_summary": wandb.plot.bar(
+                    table, "Task Name", "Metric Value", title="Evaluation Metrics Summary"
+                )
+            })
+            logger.info("Uploaded evaluation summary to WandB.")
+
+        except Exception as e:
+            logger.warning(f"Failed to upload results to wandb: {e}")
+
     return results
 
 
@@ -360,6 +386,18 @@ def main():
     parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
+    
+    # Router Calibration arguments (for Qwen2-MoE)
+    parser.add_argument("--calibrate_router", default=False, action="store_true",
+                        help="Enable Router Calibration using TopK-MSE loss for Qwen2-MoE")
+    parser.add_argument("--router_lr", type=float, default=1e-3,
+                        help="Learning rate for router calibration")
+    parser.add_argument("--router_epochs", type=int, default=5,
+                        help="Number of epochs for router calibration per layer")
+    parser.add_argument("--k_loss", type=int, default=20,
+                        help="TopK for loss calculation (number of experts to cache for TopK-MSE)")
+    parser.add_argument("--k_routing", type=int, default=4,
+                        help="TopK for expert shift metric (actual routing k used in the model)")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -492,6 +530,12 @@ def main():
             gate_lora_lr=args.gate_lora_lr,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
+            # Router Calibration parameters
+            calibrate_router=args.calibrate_router,
+            router_lr=args.router_lr,
+            router_epochs=args.router_epochs,
+            k_loss=args.k_loss,
+            k_routing=args.k_routing,
         )
         logger.info(time.time() - tick)
     if args.save_dir:
