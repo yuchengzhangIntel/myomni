@@ -352,8 +352,16 @@ class QuantQwen2MoeDecoderLayer(nn.Module):
     
     def named_modules(self, memo=None, prefix='', remove_duplicate=True):
         """Include wrapped layer's modules in named_modules iteration."""
-        yield from super().named_modules(memo, prefix, remove_duplicate)
-        yield from self.layer.named_modules(memo, prefix + 'layer.' if prefix else 'layer.', remove_duplicate)
+        # First yield self
+        if memo is None:
+            memo = set()
+        if self not in memo:
+            if remove_duplicate:
+                memo.add(self)
+            yield prefix, self
+        # Then yield all modules from the wrapped layer (without extra prefix)
+        for name, module in self.layer.named_modules(memo=memo, prefix=prefix, remove_duplicate=remove_duplicate):
+            yield name, module
     
     def named_parameters(self, prefix='', recurse=True):
         """Include wrapped layer's parameters."""

@@ -376,17 +376,35 @@ def omniquant(
                     param.requires_grad = False
                 
                 # Enable gradient only for router gate
+                # Handle both nn.Linear and LoraLinear (when train_gate_lora is enabled)
                 router_gate_params = []
+                router_gate_found = False
                 for name, module in qlayer.named_modules():
-                    if (name.endswith(".gate") or name == "gate" or 
-                        name.endswith("layer.mlp.gate") or name == "layer.mlp.gate"):
-                        if isinstance(module, nn.Linear):
+                    # Check if this is a router gate (not gate_proj)
+                    is_router_gate = (name.endswith(".gate") or name == "gate" or 
+                                      name.endswith("layer.mlp.gate") or name == "layer.mlp.gate" or
+                                      name == "mlp.gate")
+                    
+                    if is_router_gate:
+                        router_gate_found = True
+                        if isinstance(module, LoraLinear):
+                            # LoraLinear: train the original weight (not LoRA adapters)
                             module.weight.requires_grad = True
                             router_gate_params.append(module.weight)
                             if module.bias is not None:
                                 module.bias.requires_grad = True
                                 router_gate_params.append(module.bias)
-                            logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name}")
+                            logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (LoraLinear, training base weight)")
+                        elif isinstance(module, nn.Linear):
+                            module.weight.requires_grad = True
+                            router_gate_params.append(module.weight)
+                            if module.bias is not None:
+                                module.bias.requires_grad = True
+                                router_gate_params.append(module.bias)
+                            logger.info(f"[Router Calibration] Layer {i}: Enabled gradient for {name} (nn.Linear)")
+                
+                if not router_gate_found:
+                    logger.warning(f"[Router Calibration] Layer {i}: Router gate module not found! Available modules: {[n for n, _ in qlayer.named_modules()][:20]}...")
                 
                 if router_gate_params:
                     router_optimizer = torch.optim.AdamW(router_gate_params, lr=router_lr, weight_decay=0)
@@ -436,6 +454,8 @@ def omniquant(
                             global_step += 1
                     
                     del router_optimizer
+                else:
+                    logger.warning(f"[Router Calibration] Layer {i}: No router gate parameters found to train! Skipping calibration.")
                 
                 # Restore requires_grad states
                 for name, param in qlayer.named_parameters():
