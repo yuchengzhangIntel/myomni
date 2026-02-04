@@ -419,12 +419,14 @@ def omniquant(
                             router_optimizer.zero_grad()
                             
                             # Forward with router logits (keep dtype consistent with model weights)
-                            _, router_logits = qlayer(
-                                quant_inps[j].unsqueeze(0),
-                                attention_mask=attention_mask,
-                                position_ids=position_ids,
-                                output_router_logits=True
-                            )
+                            # Use autocast to prevent instability (NaNs) in mixed precision
+                            with torch.cuda.amp.autocast():
+                                _, router_logits = qlayer(
+                                    quant_inps[j].unsqueeze(0),
+                                    attention_mask=attention_mask,
+                                    position_ids=position_ids,
+                                    output_router_logits=True
+                                )
                             
                             if router_logits is not None:
                                 if epoch == 0 and j == 0:
@@ -451,6 +453,15 @@ def omniquant(
                                     )
                                 if not torch.isfinite(loss):
                                     logger.warning(f"[Router Calibration] Layer {i}: Non-finite loss detected, skipping step.")
+                                    try:
+                                        logger.warning(
+                                            f"Debug: router_logits min={router_logits.min().item():.4e}, "
+                                            f"max={router_logits.max().item():.4e}, "
+                                            f"nan={torch.isnan(router_logits).any().item()}, "
+                                            f"inf={torch.isinf(router_logits).any().item()}"
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Failed to print debug info: {e}")
                                     continue
 
                                 loss.backward()
