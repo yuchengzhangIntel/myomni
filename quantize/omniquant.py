@@ -312,6 +312,9 @@ def omniquant(
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
 
+        # Ensure QuantLinear runs in full-precision mode before router calibration
+        set_quant_state(qlayer, weight_quant=False, act_quant=False)
+
         # =================================================================
         # Router Calibration for Qwen2-MoE (Task 4)
         # =================================================================
@@ -424,6 +427,13 @@ def omniquant(
                             )
                             
                             if router_logits is not None:
+                                if epoch == 0 and j == 0:
+                                    logger.info(
+                                        f"[Router Calibration][Debug] router_logits: shape={tuple(router_logits.shape)}, "
+                                        f"dtype={router_logits.dtype}, min={router_logits.min().item():.4e}, "
+                                        f"max={router_logits.max().item():.4e}, has_nan={torch.isnan(router_logits).any().item()}, "
+                                        f"has_inf={torch.isinf(router_logits).any().item()}"
+                                    )
                                 # Compute TopK-MSE loss
                                 loss = compute_topk_mse_loss(
                                     router_logits,
@@ -431,6 +441,14 @@ def omniquant(
                                     teacher_indices[j:j+1],
                                     seqlen=seqlen
                                 )
+                                if epoch == 0 and j == 0:
+                                    logger.info(
+                                        f"[Router Calibration][Debug] loss={loss.item():.6e}, "
+                                        f"teacher_probs: shape={tuple(teacher_probs[j:j+1].shape)}, "
+                                        f"dtype={teacher_probs[j:j+1].dtype}, "
+                                        f"min={teacher_probs[j:j+1].min().item():.4e}, "
+                                        f"max={teacher_probs[j:j+1].max().item():.4e}"
+                                    )
                                 if not torch.isfinite(loss):
                                     logger.warning(f"[Router Calibration] Layer {i}: Non-finite loss detected, skipping step.")
                                     continue

@@ -148,6 +148,14 @@ def capture_router_labels_layerwise(layer, inps, attention_mask, position_ids, d
         if captured_data:
             all_values.append(captured_data[0][0])  # [1, seqlen, topk]
             all_indices.append(captured_data[0][1])  # [1, seqlen, topk]
+            if logger is not None and j == 0:
+                values_dbg, indices_dbg = captured_data[0]
+                logger.info(
+                    f"[Router Calibration][Debug] captured_values: shape={tuple(values_dbg.shape)}, "
+                    f"dtype={values_dbg.dtype}, min={values_dbg.min().item():.4e}, "
+                    f"max={values_dbg.max().item():.4e}, has_nan={torch.isnan(values_dbg).any().item()}, "
+                    f"has_inf={torch.isinf(values_dbg).any().item()}"
+                )
     
     hook.remove()
     
