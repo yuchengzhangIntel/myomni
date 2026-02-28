@@ -39,6 +39,18 @@ def add_new_module(name, original_module, added_module):
     else:
         setattr(original_module, name, added_module)     
 
+
+def is_qwen2_moe_model(model, args):
+    model_type = getattr(model.config, "model_type", "")
+    net_name = args.net.lower()
+    return model_type == "qwen2_moe" or "qwen2" in net_name or "qwen" in net_name
+
+
+def get_linear_quant_params(name, args):
+    if "self_attn" in name:
+        return args.attn_weight_quant_params, args.attn_act_quant_params
+    return args.ffn_weight_quant_params, args.ffn_act_quant_params
+
 def omniquant(
     lm,
     args,
@@ -55,6 +67,7 @@ def omniquant(
     use_cache = model.config.use_cache
     model.config.use_cache = False
     is_llama = False
+    is_qwen2_moe = is_qwen2_moe_model(model, args)
     if "llama" in args.net.lower():
         is_llama = True
         layers = model.model.layers
@@ -95,8 +108,14 @@ def omniquant(
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
         layer_name_prefix = "model.layers"
+    elif is_qwen2_moe:
+        is_llama = True
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen2-moe now")
     
     
     layers[0] = layers[0].to(dev)
@@ -104,8 +123,8 @@ def omniquant(
         dtype = torch.float
         traincast = nullcontext
     else:
-        dtype = torch.float16
-        traincast = torch.cuda.amp.autocast
+        dtype = torch.bfloat16
+        traincast = lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
     inps = torch.zeros(
         (args.nsamples, lm.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
@@ -121,9 +140,9 @@ def omniquant(
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
             cache["i"] += 1
-            cache["attention_mask"] = kwargs["attention_mask"]
+            cache["attention_mask"] = kwargs.get("attention_mask", None)
             if self.is_llama:
-                cache["position_ids"] = kwargs["position_ids"]
+                cache["position_ids"] = kwargs.get("position_ids", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -141,7 +160,7 @@ def omniquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "mixtral" in args.net.lower():
+    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or is_qwen2_moe:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     elif "opt" in args.net.lower():
@@ -151,10 +170,10 @@ def omniquant(
             model.model.decoder.project_out = model.model.decoder.project_out.cpu()
         if hasattr(model.model.decoder, "project_in") and model.model.decoder.project_in:
             model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    elif 'falcon' in args.model:
+    elif 'falcon' in args.net.lower():
         model.transformer.word_embeddings =  model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen2-moe now")
     torch.cuda.empty_cache()
 
     
@@ -166,7 +185,10 @@ def omniquant(
     attention_mask = cache["attention_mask"]
 
     if attention_mask is not None:
-        attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1) if args.deactive_amp else attention_mask.repeat(args.batch_size,1,1,1).float()
+        if args.deactive_amp:
+            attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1)
+        else:
+            attention_mask_batch = attention_mask.repeat(args.batch_size,1,1,1).to(dtype=dtype)
     else:
         logger.info(
             "No attention mask caught from the first layer."
@@ -192,13 +214,20 @@ def omniquant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
-        if "mixtral" in args.net.lower():  
+        if "mixtral" in args.net.lower() or is_qwen2_moe:
             # for mixtral, we only leverage lwc, which can be achieve by simply replace Linear with QuantLinear
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
-                if isinstance(module,torch.nn.Linear) and not "gate" in name:       # do not quantize gate
-                    quantlinear = QuantLinear(module, args.weight_quant_params, args.act_quant_params)
-                    add_new_module(name, qlayer, quantlinear)    
+                if not isinstance(module, torch.nn.Linear):
+                    continue
+                leaf_name = name.split(".")[-1]
+                if "mixtral" in args.net.lower() and "gate" in name:
+                    continue
+                if is_qwen2_moe and leaf_name in ["gate", "shared_expert_gate"]:
+                    continue
+                weight_quant_params, act_quant_params = get_linear_quant_params(name, args)
+                quantlinear = QuantLinear(module, weight_quant_params, act_quant_params)
+                add_new_module(name, qlayer, quantlinear)
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
@@ -208,7 +237,7 @@ def omniquant(
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
         if args.epochs > 0:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with traincast():
                     for j in range(args.nsamples):
                         fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
                         if args.aug_loss:
@@ -217,9 +246,12 @@ def omniquant(
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
         use_shift = True 
-        if is_llama or args.abits == 16:
+        if is_qwen2_moe and args.let:
+            logger.info("Qwen2-MoE currently uses LWC-only path. Disable LET automatically.")
+            qlayer.let = False
+        if is_llama or args.attn_abits == 16:
             use_shift = False                   # deactivate channel-wise shifting for llama model and weight-only quantization
-        if args.let:
+        if qlayer.let:
             # init channel-wise scaling and shift
             qlayer.register_parameter("qkt_smooth_scale",torch.nn.Parameter(torch.ones(layer.self_attn.q_proj.out_features,device=dev, dtype=dtype)))
             for name,module in qlayer.named_modules():
@@ -242,7 +274,10 @@ def omniquant(
 
         if args.epochs > 0:
             with torch.no_grad():
-                qlayer.float()      # required for AMP training
+                if args.deactive_amp:
+                    qlayer.float()
+                else:
+                    qlayer = qlayer.to(torch.bfloat16)
             # create optimizer
             optimizer = torch.optim.AdamW(
                 [{"params":let_parameters(qlayer, use_shift),"lr":args.let_lr}, {"params":lwc_parameters(qlayer),"lr":args.lwc_lr}],weight_decay=args.wd)
@@ -274,7 +309,7 @@ def omniquant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
             clear_temp_variable(qlayer)
             del optimizer
-        qlayer.half() 
+        qlayer = qlayer.to(torch.bfloat16)
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
         if args.epochs>0:
@@ -292,7 +327,7 @@ def omniquant(
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
         if args.real_quant:
-            assert args.wbits in [2,3,4] and args.abits >= 16   # only support weight-only quantization
+            assert all(wbits in [2,3,4] for wbits in [args.attn_wbits, args.ffn_wbits]) and min(args.attn_abits, args.ffn_abits) >= 16   # only support weight-only quantization
             named_linears = get_named_linears(qlayer)
             for name, module in named_linears.items():
                 scales = module.weight_quantizer.scales
@@ -301,10 +336,11 @@ def omniquant(
                 dim0 = module.weight.shape[0]
                 scales = scales.view(dim0,-1)
                 zeros = zeros.view(dim0,-1)
-                if args.wbits == 3:
-                    q_linear = qlinear_cuda.QuantLinear(args.wbits, group_size, module.in_features,module.out_features,not module.bias is None)
+                cur_wbits = args.attn_wbits if "self_attn" in name else args.ffn_wbits
+                if cur_wbits == 3:
+                    q_linear = qlinear_cuda.QuantLinear(cur_wbits, group_size, module.in_features,module.out_features,not module.bias is None)
                 else:
-                    q_linear = qlinear_triton.QuantLinear(args.wbits, group_size, module.in_features,module.out_features,not module.bias is None)
+                    q_linear = qlinear_triton.QuantLinear(cur_wbits, group_size, module.in_features,module.out_features,not module.bias is None)
                 q_linear.pack(module.cpu(),  scales.float().cpu(), zeros.float().cpu())
                 add_new_module(name, qlayer, q_linear)       
                 print(f"pack quantized {name} finished")
