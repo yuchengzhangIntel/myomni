@@ -31,14 +31,23 @@ class QuantLlamaMLP(nn.Module):
         # self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         # self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.gate_proj = QuantLinear(org_module.gate_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                           args.weight_quant_params,
+                           args.act_quant_params,
+                           use_linear_lora=getattr(args, 'use_linear_lora', False),
+                           linear_lora_r=getattr(args, 'linear_lora_r', 16),
+                           linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0))
         self.down_proj = QuantLinear(org_module.down_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                           args.weight_quant_params,
+                           args.act_quant_params,
+                           use_linear_lora=getattr(args, 'use_linear_lora', False),
+                           linear_lora_r=getattr(args, 'linear_lora_r', 16),
+                           linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0))
         self.up_proj = QuantLinear(org_module.up_proj,
-                                           args.weight_quant_params,
-                                           args.act_quant_params)
+                           args.weight_quant_params,
+                           args.act_quant_params,
+                           use_linear_lora=getattr(args, 'use_linear_lora', False),
+                           linear_lora_r=getattr(args, 'linear_lora_r', 16),
+                           linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0))
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -73,19 +82,33 @@ class QuantLlamaAttention(nn.Module):
             org_module.k_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.o_proj = QuantLinear(
-            org_module.o_proj, args.weight_quant_params, args.act_quant_params
+            org_module.o_proj,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.matmul
@@ -294,14 +317,14 @@ class QuantLlamaDecoderLayer(nn.Module):
         else:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
-                    module.temp_weight = module.weight
+                    module.temp_weight = module.get_effective_weight()
         # quant
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 if hasattr(module, "temp_weight"):
                     module.temp_weight = module.weight_quantizer(module.temp_weight)
                 else:
-                    module.temp_weight = module.weight_quantizer(module.weight)
+                    module.temp_weight = module.weight_quantizer(module.get_effective_weight())
                 if not hasattr(module, "temp_bias"):
                     module.temp_bias = module.bias
                 module.use_temporary_parameter=True
@@ -328,6 +351,7 @@ class QuantLlamaDecoderLayer(nn.Module):
                                 self.qkt_smooth_scale)
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
+                module.merge_lora()
                 module.weight = module.weight_quantizer(module.weight)
                 module.use_temporary_parameter=False
 

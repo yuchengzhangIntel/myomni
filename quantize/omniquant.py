@@ -313,7 +313,14 @@ def omniquant(
                         # Replace with QuantLinear
                         is_attn_linear = name.startswith("self_attn.") and name.split(".")[-1] in {"q_proj", "k_proj", "v_proj", "o_proj"}
                         weight_params = args.attn_weight_quant_params if (is_attn_linear and args.attn_weight_quant_params is not None) else args.weight_quant_params
-                        quantlinear = QuantLinear(module, weight_params, args.act_quant_params)
+                        quantlinear = QuantLinear(
+                            module,
+                            weight_params,
+                            args.act_quant_params,
+                            use_linear_lora=getattr(args, 'use_linear_lora', False),
+                            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+                            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
+                        )
                         add_new_module(name, qlayer, quantlinear)    
         else:
             qlayer = DecoderLayer(lm.model.config, layer, args)
@@ -636,6 +643,14 @@ def omniquant(
                         lora_params.extend([module.lora_A, module.lora_B])
                 if lora_params:
                     param_groups.append({"params": lora_params, "lr": gate_lora_lr, "weight_decay": args.wd})
+
+            if getattr(args, 'use_linear_lora', False):
+                linear_lora_params = []
+                for name, module in qlayer.named_modules():
+                    if isinstance(module, QuantLinear):
+                        linear_lora_params.extend(module.get_lora_parameters())
+                if linear_lora_params:
+                    param_groups.append({"params": linear_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
             
             # Default weight_decay=0 for optimizer (each group specifies its own)
             optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
@@ -656,6 +671,11 @@ def omniquant(
                 for name, module in qlayer.named_modules():
                     if isinstance(module, LoraLinear):
                         clip_parameters.extend([module.lora_A, module.lora_B])
+
+            if getattr(args, 'use_linear_lora', False):
+                for name, module in qlayer.named_modules():
+                    if isinstance(module, QuantLinear):
+                        clip_parameters.extend(module.get_lora_parameters())
             
             # Log training configuration once per block (first layer only)
             if i == 0:
@@ -663,7 +683,9 @@ def omniquant(
                     logger.info(f"[Gate Training] shared_expert_gate training ENABLED with lr={shared_gate_lr}")
                 if train_gate_lora:
                     logger.info(f"[Gate Training] router gate LoRA training ENABLED with r={lora_r}, alpha={lora_alpha}, lr={gate_lora_lr}")
-                if not train_shared_gate and not train_gate_lora:
+                if getattr(args, 'use_linear_lora', False):
+                    logger.info(f"[Linear LoRA] QuantLinear LoRA ENABLED with r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr}")
+                if not train_shared_gate and not train_gate_lora and not getattr(args, 'use_linear_lora', False):
                     logger.info("[Gate Training] All gate training DISABLED (default behavior)")
             
             for epochs in range(args.epochs):
@@ -701,6 +723,7 @@ def omniquant(
                 gate_grad_info = ""
                 shared_gate_grad_norm = 0.0
                 lora_grad_norm = 0.0
+                linear_lora_grad_norm = 0.0
                 
                 if train_shared_gate:
                     for name, module in qlayer.named_modules():
@@ -719,6 +742,15 @@ def omniquant(
                                 lora_grad_norm += module.lora_B.grad.norm().item() ** 2
                     lora_grad_norm = lora_grad_norm ** 0.5
                     gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
+
+                if getattr(args, 'use_linear_lora', False):
+                    for name, module in qlayer.named_modules():
+                        if isinstance(module, QuantLinear):
+                            for param in module.get_lora_parameters():
+                                if param.grad is not None:
+                                    linear_lora_grad_norm += param.grad.norm().item() ** 2
+                    linear_lora_grad_norm = linear_lora_grad_norm ** 0.5
+                    gate_grad_info += f" linear_lora_grad:{linear_lora_grad_norm:.2e}"
                 
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
                 final_loss = loss_mean.item()  # always update; after loop ends this holds last layer's last epoch loss
@@ -728,6 +760,7 @@ def omniquant(
                     # Extract learning rates from optimizer param_groups
                     lr_shared_gate = None
                     lr_router_lora = None
+                    lr_linear_lora = None
                     for pg in optimizer.param_groups:
                         # Identify groups by checking if they contain shared_gate or lora params
                         if len(pg['params']) > 0:
@@ -746,6 +779,12 @@ def omniquant(
                                         if any(module.lora_A is pp or module.lora_B is pp for pp in pg['params']):
                                             lr_router_lora = pg['lr']
                                             break
+                            if getattr(args, 'use_linear_lora', False) and lr_linear_lora is None:
+                                for name, module in qlayer.named_modules():
+                                    if isinstance(module, QuantLinear):
+                                        if any(param is pp for param in module.get_lora_parameters() for pp in pg['params']):
+                                            lr_linear_lora = pg['lr']
+                                            break
                     
                     # Build metrics dict with strict naming schema
                     wandb_metrics = {
@@ -760,12 +799,16 @@ def omniquant(
                         wandb_metrics["grad/shared_expert_norm"] = shared_gate_grad_norm
                     if train_gate_lora:
                         wandb_metrics["grad/router_lora_norm"] = lora_grad_norm
+                    if getattr(args, 'use_linear_lora', False):
+                        wandb_metrics["grad/linear_lora_norm"] = linear_lora_grad_norm
                     
                     # Add learning rates for hyperparameter tracking
                     if lr_shared_gate is not None:
                         wandb_metrics["lr/shared_gate"] = lr_shared_gate
                     if lr_router_lora is not None:
                         wandb_metrics["lr/router_lora"] = lr_router_lora
+                    if lr_linear_lora is not None:
+                        wandb_metrics["lr/linear_lora"] = lr_linear_lora
                     if calibrate_router:
                         wandb_metrics["lr/router_lr"] = router_lr
                     

@@ -21,9 +21,23 @@ class QuantFalconMLP(nn.Module):
     def __init__(self, org_module: nn.Module,args=None):
         super().__init__()
 
-        self.dense_h_to_4h = QuantLinear(org_module.dense_h_to_4h,args.weight_quant_params,args.act_quant_params)
+        self.dense_h_to_4h = QuantLinear(
+            org_module.dense_h_to_4h,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
+        )
         self.act = nn.GELU()
-        self.dense_4h_to_h = QuantLinear(org_module.dense_4h_to_h,args.weight_quant_params,args.act_quant_params)
+        self.dense_4h_to_h = QuantLinear(
+            org_module.dense_4h_to_h,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act(self.dense_h_to_4h(x))
@@ -54,10 +68,24 @@ class QuantFalconAttention(nn.Module):
         # Layer-wise attention scaling
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         self.beta = self.inv_norm_factor
-        self.query_key_value = QuantLinear(org_module.query_key_value,args.weight_quant_params,args.act_quant_params)
+        self.query_key_value = QuantLinear(
+            org_module.query_key_value,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
+        )
         self.new_decoder_architecture = config.new_decoder_architecture
         self.multi_query = config.multi_query
-        self.dense =QuantLinear(org_module.dense,args.weight_quant_params,args.act_quant_params)
+        self.dense = QuantLinear(
+            org_module.dense,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
+        )
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.num_kv_heads = config.num_kv_heads if (self.new_decoder_architecture or not self.multi_query) else 1
 
@@ -331,6 +359,7 @@ class QuantFalconDecoderLayer(nn.Module):
             raise ValueError("falcon not yet support let")
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
+                module.merge_lora()
                 module.weight = module.weight_quantizer(module.weight)
                 module.use_temporary_parameter=False
                 
@@ -347,14 +376,14 @@ class QuantFalconDecoderLayer(nn.Module):
         else:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
-                    module.temp_weight = module.weight
+                    module.temp_weight = module.get_effective_weight()
         # quant
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 if hasattr(module, "temp_weight"):
                     module.temp_weight = module.weight_quantizer(module.temp_weight)
                 else:
-                    module.temp_weight = module.weight_quantizer(module.weight)
+                    module.temp_weight = module.weight_quantizer(module.get_effective_weight())
                 if not hasattr(module, "temp_bias"):
                     module.temp_bias = module.bias
                 module.use_temporary_parameter=True

@@ -363,14 +363,14 @@ def smooth_and_quant_temporary(model, args, isllama):
     else:
         for name, module in model.named_modules():
             if isinstance(module, QuantLinear):
-                module.temp_weight = module.weight.detach()
+                module.temp_weight = module.get_effective_weight()
     # quant
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
             if hasattr(module, "temp_weight"):
                 module.temp_weight = module.weight_quantizer(module.temp_weight)
             else:
-                module.temp_weight = module.weight_quantizer(module.weight)
+                module.temp_weight = module.weight_quantizer(module.get_effective_weight())
             if not hasattr(module, "temp_bias"):
                 module.temp_bias = module.bias
             module.use_temporary_parameter=True
@@ -408,6 +408,7 @@ def smooth_and_quant_inplace(model, args, isllama):
                             model.qkt_smooth_scale)
     for name, module in model.named_modules():
         if isinstance(module, QuantLinear):
+            module.merge_lora()
             module.weight = module.weight_quantizer(module.weight)
             module.use_temporary_parameter=False
 

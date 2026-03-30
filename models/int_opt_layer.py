@@ -47,19 +47,33 @@ class QuantOPTAttention(nn.Module):
             org_module.k_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
             args.weight_quant_params,
             args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.out_proj = QuantLinear(
-            org_module.out_proj, args.weight_quant_params, args.act_quant_params
+            org_module.out_proj,
+            args.weight_quant_params,
+            args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.bmm
@@ -254,11 +268,17 @@ class QuantOPTDecoderLayer(nn.Module):
             ori_layer.fc1,
             weight_quant_params=args.weight_quant_params,
             act_quant_params=args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.fc2 = QuantLinear(
             ori_layer.fc2,
             weight_quant_params=args.weight_quant_params,
             act_quant_params=args.act_quant_params,
+            use_linear_lora=getattr(args, 'use_linear_lora', False),
+            linear_lora_r=getattr(args, 'linear_lora_r', 16),
+            linear_lora_alpha=getattr(args, 'linear_lora_alpha', 16.0),
         )
         self.final_layer_norm = OmniLayerNorm(
             ori_layer.final_layer_norm
@@ -372,6 +392,7 @@ class QuantOPTDecoderLayer(nn.Module):
                                 self.qkt_smooth_scale)
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
+                module.merge_lora()
                 module.weight = module.weight_quantizer(module.weight)
                 module.use_temporary_parameter=False
                 
@@ -400,14 +421,14 @@ class QuantOPTDecoderLayer(nn.Module):
         else:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
-                    module.temp_weight = module.weight
+                    module.temp_weight = module.get_effective_weight()
         # quant
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 if hasattr(module, "temp_weight"):
                     module.temp_weight = module.weight_quantizer(module.temp_weight)
                 else:
-                    module.temp_weight = module.weight_quantizer(module.weight)
+                    module.temp_weight = module.weight_quantizer(module.get_effective_weight())
                 if not hasattr(module, "temp_bias"):
                     module.temp_bias = module.bias
                 module.use_temporary_parameter=True

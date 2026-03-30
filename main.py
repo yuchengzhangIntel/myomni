@@ -428,6 +428,14 @@ def main():
     parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
+    parser.add_argument("--use_linear_lora", default=False, action="store_true",
+                        help="Enable LoRA on QuantLinear layers during block-wise quantization")
+    parser.add_argument("--linear_lora_r", type=int, default=16,
+                        help="LoRA rank for QuantLinear layers")
+    parser.add_argument("--linear_lora_alpha", type=float, default=16.0,
+                        help="LoRA alpha for QuantLinear layers")
+    parser.add_argument("--linear_lora_lr", type=float, default=1e-4,
+                        help="Learning rate for QuantLinear LoRA parameters")
     
     # Router Calibration arguments (for Qwen MoE models)
     parser.add_argument("--calibrate_router", default=False, action="store_true",
@@ -450,6 +458,15 @@ def main():
     # check
     if args.epochs > 0:
         assert args.lwc or args.let
+
+    if args.use_linear_lora and args.let:
+        raise ValueError("--use_linear_lora is not supported together with --let in this implementation")
+
+    if args.use_linear_lora and args.resume:
+        raise ValueError("--use_linear_lora does not currently support --resume")
+
+    if args.use_linear_lora and args.linear_lora_r <= 0:
+        raise ValueError("--linear_lora_r must be positive when --use_linear_lora is enabled")
 
     if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16 and args.abits >= 8):
         args.deactive_amp = True
@@ -474,6 +491,8 @@ def main():
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
+    logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"
+                + (f"  (r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr})" if args.use_linear_lora else ""))
     logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
     logger.info("=" * 60)
@@ -630,6 +649,8 @@ def main():
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
+    logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"
+                + (f"  (r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr})" if args.use_linear_lora else ""))
     logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
