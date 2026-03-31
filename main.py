@@ -448,6 +448,10 @@ def main():
                         help="TopK for loss calculation (number of experts to cache for TopK-MSE)")
     parser.add_argument("--k_routing", type=int, default=4,
                         help="TopK for expert shift metric (actual routing k used in the model)")
+    parser.add_argument("--quant_routing_top_n", type=int, default=None,
+                        help="Top-N experts to cache for MoE self-supervision; defaults to the layer routing top-k")
+    parser.add_argument("--use_router_weight_in_loss", default=False, action="store_true",
+                        help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -467,6 +471,16 @@ def main():
 
     if args.use_linear_lora and args.linear_lora_r <= 0:
         raise ValueError("--linear_lora_r must be positive when --use_linear_lora is enabled")
+
+    effective_net_name = (args.net or args.model.split('/')[-1]).lower()
+    if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.let:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --let")
+    if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.train_gate_lora:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_gate_lora without an explicit router loss")
+    if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.train_shared_gate:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_shared_gate without an explicit shared-gate loss")
+    if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.calibrate_router:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --calibrate_router")
 
     if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16 and args.abits >= 8):
         args.deactive_amp = True
@@ -495,6 +509,8 @@ def main():
                 + (f"  (r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr})" if args.use_linear_lora else ""))
     logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
+    logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
+    logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info("=" * 60)
 
     if args.enable_wandb:
@@ -620,6 +636,8 @@ def main():
             router_epochs=args.router_epochs,
             k_loss=args.k_loss,
             k_routing=args.k_routing,
+            quant_routing_top_n=args.quant_routing_top_n,
+            use_router_weight_in_loss=args.use_router_weight_in_loss,
         )
         logger.info(time.time() - tick)
     if args.save_dir:
@@ -653,6 +671,8 @@ def main():
                 + (f"  (r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr})" if args.use_linear_lora else ""))
     logger.info(f"  Train Shared Gate         : {'ON' if args.train_shared_gate else 'OFF'}"
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
+    logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
+    logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results
     wiki2_ppl = results.get('wikitext2', 'N/A')

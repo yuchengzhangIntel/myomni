@@ -20,6 +20,17 @@ from quantize.utils import (
     compute_topk_mse_loss, forward_with_router_logits, create_router_hook,
     call_layer_forward, extract_hidden_states
 )
+from quantize.moe_utils import (
+    QuantizedPackedExperts,
+    compute_expert_down_proj_output,
+    compute_router_scores,
+    get_moe_experts_module,
+    get_moe_top_k,
+    get_shared_expert_module,
+    is_packed_experts_module,
+    pin_cpu_tensor,
+    select_top_n_experts,
+)
 
 
 class LoraLinear(nn.Module):
@@ -95,6 +106,316 @@ def add_new_module(name, original_module, added_module):
     else:
         setattr(original_module, name, added_module)     
 
+
+def collect_stage_parameters(module, prefixes, include_linear_lora=False):
+    lwc_params = []
+    linear_lora_params = []
+    seen = set()
+
+    for name, param in module.named_parameters():
+        if not any(name.startswith(prefix) for prefix in prefixes):
+            continue
+        if "bound_factor" in name and id(param) not in seen:
+            lwc_params.append(param)
+            seen.add(id(param))
+        elif include_linear_lora and (name.endswith("lora_A") or name.endswith("lora_B")) and id(param) not in seen:
+            linear_lora_params.append(param)
+            seen.add(id(param))
+
+    return lwc_params, linear_lora_params
+
+
+def compute_attention_outputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
+    normed_hidden_states = layer.input_layernorm(hidden_states)
+    return extract_hidden_states(call_layer_forward(
+        layer.self_attn,
+        normed_hidden_states,
+        layer_kwargs=layer_kwargs,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+    ))
+
+
+def compute_mlp_inputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
+    attention_outputs = compute_attention_outputs(
+        layer,
+        hidden_states,
+        layer_kwargs,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+    )
+    post_attention_hidden_states = hidden_states + attention_outputs
+    mlp_inputs = layer.post_attention_layernorm(post_attention_hidden_states)
+    return attention_outputs, post_attention_hidden_states, mlp_inputs
+
+
+def resolve_quant_routing_top_n(moe_module, requested_top_n):
+    layer_top_k = get_moe_top_k(moe_module)
+    if layer_top_k is None:
+        return requested_top_n
+    if requested_top_n is None:
+        return layer_top_k
+    if requested_top_n < layer_top_k:
+        raise ValueError(
+            f"quant_routing_top_n ({requested_top_n}) must be greater than or equal to the layer top-k ({layer_top_k})"
+        )
+    return requested_top_n
+
+
+def build_moe_label_cache(layer, fp_inputs, layer_kwargs, attention_mask, position_ids, top_n):
+    label_cache = []
+    shared_expert = get_shared_expert_module(layer.mlp)
+    experts_module = get_moe_experts_module(layer.mlp)
+
+    with torch.no_grad():
+        for sample_idx in range(fp_inputs.shape[0]):
+            sample_inputs = fp_inputs[sample_idx].unsqueeze(0)
+            _, _, mlp_inputs = compute_mlp_inputs(
+                layer,
+                sample_inputs,
+                layer_kwargs,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
+            flat_mlp_inputs = mlp_inputs.reshape(-1, mlp_inputs.shape[-1])
+            router_scores = compute_router_scores(layer.mlp, flat_mlp_inputs)
+            top_indices, top_weights = select_top_n_experts(router_scores, top_n)
+
+            sample_cache = {
+                "expert_labels": {},
+                "shared_labels": None,
+            }
+
+            for expert_idx_tensor in torch.unique(top_indices):
+                expert_idx = int(expert_idx_tensor.item())
+                token_idx, top_pos = torch.where(top_indices == expert_idx)
+                labels = compute_expert_down_proj_output(
+                    experts_module,
+                    expert_idx,
+                    flat_mlp_inputs[token_idx],
+                )
+                sample_cache["expert_labels"][expert_idx] = {
+                    "token_idx": pin_cpu_tensor(token_idx),
+                    "weights": pin_cpu_tensor(top_weights[token_idx, top_pos]),
+                    "labels": pin_cpu_tensor(labels),
+                }
+
+            if shared_expert is not None:
+                shared_outputs = extract_hidden_states(call_layer_forward(shared_expert, flat_mlp_inputs))
+                sample_cache["shared_labels"] = pin_cpu_tensor(shared_outputs)
+
+            label_cache.append(sample_cache)
+
+    return label_cache
+
+
+def compute_moe_self_supervision_loss(
+    qlayer,
+    quant_inputs,
+    batch_label_cache,
+    layer_kwargs,
+    attention_mask,
+    position_ids,
+    use_router_weight_in_loss,
+    precomputed_mlp_inputs=None,
+):
+    if precomputed_mlp_inputs is None:
+        _, _, mlp_inputs = compute_mlp_inputs(
+            qlayer,
+            quant_inputs,
+            layer_kwargs,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+    else:
+        mlp_inputs = precomputed_mlp_inputs
+    experts_module = get_moe_experts_module(qlayer.mlp)
+    shared_expert = get_shared_expert_module(qlayer.mlp)
+    loss_terms = []
+
+    for batch_idx, sample_cache in enumerate(batch_label_cache):
+        sample_inputs = mlp_inputs[batch_idx]
+        for expert_idx, cached_values in sample_cache["expert_labels"].items():
+            token_idx = cached_values["token_idx"].to(sample_inputs.device, non_blocking=True)
+            teacher_labels = cached_values["labels"].to(sample_inputs.device, non_blocking=True)
+            student_labels = compute_expert_down_proj_output(
+                experts_module,
+                expert_idx,
+                sample_inputs[token_idx],
+            )
+            expert_loss = (student_labels.float() - teacher_labels.float()).pow(2).mean(dim=-1)
+            if use_router_weight_in_loss:
+                weights = cached_values["weights"].to(sample_inputs.device, non_blocking=True).float()
+                expert_loss = expert_loss * weights
+            loss_terms.append(expert_loss)
+
+        if sample_cache["shared_labels"] is not None and shared_expert is not None:
+            shared_labels = sample_cache["shared_labels"].to(sample_inputs.device, non_blocking=True)
+            student_shared = extract_hidden_states(call_layer_forward(shared_expert, sample_inputs))
+            shared_loss = (student_shared.float() - shared_labels.float()).pow(2).mean(dim=-1)
+            loss_terms.append(shared_loss)
+
+    if not loss_terms:
+        return torch.tensor(0.0, device=quant_inputs.device, requires_grad=True)
+
+    return torch.cat([term.reshape(-1) for term in loss_terms]).mean()
+
+
+def train_decoupled_moe_layer(
+    layer,
+    qlayer,
+    args,
+    logger,
+    layer_idx,
+    fp_inps,
+    quant_inps,
+    layer_kwargs,
+    attention_mask_batch,
+    attention_mask,
+    position_ids,
+    traincast,
+    quant_routing_top_n,
+    use_router_weight_in_loss,
+):
+    if args.let:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --let")
+    if getattr(args, "train_gate_lora", False):
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_gate_lora without an explicit router loss")
+    if getattr(args, "train_shared_gate", False):
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_shared_gate without an explicit shared-gate loss")
+    if getattr(args, "calibrate_router", False):
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --calibrate_router")
+
+    qlayer.float()
+    final_stage_loss = None
+    loss_func = torch.nn.MSELoss()
+    attention_prefixes = ("self_attn.",)
+    moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
+
+    attn_lwc_params, attn_lora_params = collect_stage_parameters(
+        qlayer,
+        attention_prefixes,
+        include_linear_lora=getattr(args, "use_linear_lora", False),
+    )
+    attn_param_groups = []
+    if attn_lwc_params:
+        attn_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+    if attn_lora_params:
+        attn_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+
+    if attn_param_groups and args.epochs > 0:
+        logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {args.epochs} epochs")
+        attn_optimizer = torch.optim.AdamW(attn_param_groups, weight_decay=0)
+        attn_scaler = utils.NativeScalerWithGradNormCount()
+        attn_clip_params = attn_lwc_params + attn_lora_params
+        for epoch in range(args.epochs):
+            loss_list = []
+            norm_list = []
+            for start in range(0, args.nsamples, args.batch_size):
+                end = min(start + args.batch_size, args.nsamples)
+                batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
+                attn_optimizer.zero_grad()
+                with torch.no_grad():
+                    with torch.amp.autocast('cuda'):
+                        teacher_attn_outputs = compute_attention_outputs(
+                            layer,
+                            fp_inps[start:end],
+                            layer_kwargs,
+                            attention_mask=batch_attention_mask,
+                            position_ids=position_ids,
+                        )
+                with traincast():
+                    smooth_and_quant_temporary(qlayer, args, isllama=True)
+                    student_attn_outputs = compute_attention_outputs(
+                        qlayer,
+                        quant_inps[start:end],
+                        layer_kwargs,
+                        attention_mask=batch_attention_mask,
+                        position_ids=position_ids,
+                    )
+                    loss = loss_func(student_attn_outputs, teacher_attn_outputs)
+                loss_list.append(loss.detach().cpu())
+                norm = attn_scaler(loss, attn_optimizer, parameters=attn_clip_params).cpu()
+                norm_list.append(norm)
+                clear_temp_variable(qlayer)
+
+            loss_mean = torch.stack(loss_list).mean()
+            norm_mean = torch.stack(norm_list).mean()
+            logger.info(f"[Decoupled Attention] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean}")
+            final_stage_loss = loss_mean.item()
+        del attn_optimizer
+
+    top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
+    logger.info(f"[Decoupled MoE] Layer {layer_idx}: building CPU label cache with top_n={top_n}")
+    label_cache = build_moe_label_cache(
+        layer,
+        fp_inps,
+        layer_kwargs,
+        attention_mask,
+        position_ids,
+        top_n,
+    )
+
+    moe_lwc_params, moe_lora_params = collect_stage_parameters(
+        qlayer,
+        moe_prefixes,
+        include_linear_lora=getattr(args, "use_linear_lora", False),
+    )
+    moe_param_groups = []
+    if moe_lwc_params:
+        moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+    if moe_lora_params:
+        moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+
+    if moe_param_groups and args.epochs > 0:
+        logger.info(f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs")
+        moe_optimizer = torch.optim.AdamW(moe_param_groups, weight_decay=0)
+        moe_scaler = utils.NativeScalerWithGradNormCount()
+        moe_clip_params = moe_lwc_params + moe_lora_params
+        for epoch in range(args.epochs):
+            loss_list = []
+            norm_list = []
+            for start in range(0, args.nsamples, args.batch_size):
+                end = min(start + args.batch_size, args.nsamples)
+                batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
+                moe_optimizer.zero_grad()
+                with traincast():
+                    smooth_and_quant_temporary(qlayer, args, isllama=True)
+                with torch.no_grad():
+                    with traincast():
+                        _, _, detached_mlp_inputs = compute_mlp_inputs(
+                            qlayer,
+                            quant_inps[start:end],
+                            layer_kwargs,
+                            attention_mask=batch_attention_mask,
+                            position_ids=position_ids,
+                        )
+                        detached_mlp_inputs = detached_mlp_inputs.detach()
+                with traincast():
+                    loss = compute_moe_self_supervision_loss(
+                        qlayer,
+                        quant_inps[start:end],
+                        label_cache[start:end],
+                        layer_kwargs,
+                        batch_attention_mask,
+                        position_ids,
+                        use_router_weight_in_loss,
+                        precomputed_mlp_inputs=detached_mlp_inputs,
+                    )
+                loss_list.append(loss.detach().cpu())
+                norm = moe_scaler(loss, moe_optimizer, parameters=moe_clip_params).cpu()
+                norm_list.append(norm)
+                clear_temp_variable(qlayer)
+
+            loss_mean = torch.stack(loss_list).mean()
+            norm_mean = torch.stack(norm_list).mean()
+            logger.info(f"[Decoupled MoE] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean}")
+            final_stage_loss = loss_mean.item()
+        del moe_optimizer
+
+    del label_cache
+    return final_stage_loss
+
 def omniquant(
     lm,
     args,
@@ -114,6 +435,8 @@ def omniquant(
     router_epochs=5,
     k_loss=20,      # TopK for loss calculation (cached label size)
     k_routing=4,    # TopK for expert shift metric (actual routing k)
+    quant_routing_top_n=None,
+    use_router_weight_in_loss=False,
 ):
     logger.info("Starting ...")
     
@@ -175,15 +498,18 @@ def omniquant(
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
         layer_name_prefix = "model.layers"
-    elif 'qwen' in args.net.lower():
+    elif 'qwen' in args.net.lower() or 'deepseek' in args.net.lower():
         is_llama = True   # same to llama except ffn (MoE structure)
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-        # Qwen MoE models only support the MoE/LWC path here, no DecoderLayer wrapper is needed.
+        # Qwen/DeepSeek MoE models only support the MoE/LWC path here, no DecoderLayer wrapper is needed.
         layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen/deepseek now")
+
+    if ("qwen" in args.net.lower() or "deepseek" in args.net.lower()) and args.let:
+        raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --let")
     
     
     layers[0] = layers[0].to(dev)
@@ -229,7 +555,7 @@ def omniquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower():
+    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     elif "opt" in args.net.lower():
@@ -242,7 +568,7 @@ def omniquant(
     elif 'falcon' in args.model:
         model.transformer.word_embeddings =  model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen/deepseek now")
     torch.cuda.empty_cache()
 
     
@@ -281,12 +607,17 @@ def omniquant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
-        if "mixtral" in args.net.lower() or "qwen" in args.net.lower():  
-            # For MoE models (Mixtral, Qwen MoE), only the LWC-style path is supported.
+        current_fp_layer_inputs = fp_inps
+        if "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():  
+            # For MoE models (Mixtral, Qwen/DeepSeek MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
             qlayer = copy.deepcopy(layer)
+
+            for name, module in list(qlayer.named_modules()):
+                if is_packed_experts_module(module):
+                    add_new_module(name, qlayer, QuantizedPackedExperts(module, args))
             
-            for name, module in qlayer.named_modules():
+            for name, module in list(qlayer.named_modules()):
                 if isinstance(module, torch.nn.Linear):
                     # Target 1: Shared Expert Gate - name ends with "shared_expert_gate"
                     is_shared_expert_gate = name.endswith("shared_expert_gate")
@@ -326,18 +657,17 @@ def omniquant(
             qlayer = DecoderLayer(lm.model.config, layer, args)
         qlayer = qlayer.to(dev)
 
+        use_decoupled_moe_training = (
+            ("qwen" in args.net.lower() or "deepseek" in args.net.lower())
+            and hasattr(layer, "mlp")
+            and get_moe_experts_module(layer.mlp) is not None
+        )
+
         # =================================================================
-        # Expert Shift Tracking for Qwen MoE
-        # Flow: 
-        #   1. Capture FP16 teacher labels from ORIGINAL layer
-        #   2. Set quantization state on qlayer
-        #   3. Compute Pre-LWC Expert Shift (quantized vs FP teacher)
-        #   4. (Optional) Router calibration training if calibrate_router=True
-        #   5. (Optional) Compute Post-Calibration Expert Shift
-        #   6. LWC training
-        #   7. Compute Post-LWC Expert Shift
+        # Legacy Expert Shift Tracking for Router Calibration
+        # This path is kept for the older router-focused Qwen calibration flow.
         # =================================================================
-        is_qwen_moe = "qwen" in args.net.lower()
+        is_qwen_moe = "qwen" in args.net.lower() and not use_decoupled_moe_training
         cached_router_labels = None
         pre_lwc_shift = None
         post_calib_shift = None
@@ -570,7 +900,7 @@ def omniquant(
         
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
-        if args.epochs > 0:
+        if args.epochs > 0 and not use_decoupled_moe_training:
             with torch.no_grad():
                 with torch.amp.autocast('cuda'):
                     for j in range(args.nsamples):
@@ -617,213 +947,259 @@ def omniquant(
         
 
         if args.epochs > 0:
-            with torch.no_grad():
-                qlayer.float()      # required for AMP training
-            # create optimizer with parameter groups
-            # LET/LWC parameters use weight_decay=0 (fixed, not controlled by args.wd)
-            param_groups = [
-                {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr, "weight_decay": 0},
-                {"params": lwc_parameters(qlayer), "lr": args.lwc_lr, "weight_decay": 0}
-            ]
-            
-            # Add shared_expert_gate parameters if training is enabled (uses args.wd)
-            if train_shared_gate:
-                shared_gate_params = []
-                for name, module in qlayer.named_modules():
-                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
-                        shared_gate_params.extend([p for p in module.parameters() if p.requires_grad])
-                if shared_gate_params:
-                    param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr, "weight_decay": args.wd})
-            
-            # Add LoRA parameters if training is enabled (uses args.wd)
-            if train_gate_lora:
-                lora_params = []
-                for name, module in qlayer.named_modules():
-                    if isinstance(module, LoraLinear):
-                        lora_params.extend([module.lora_A, module.lora_B])
-                if lora_params:
-                    param_groups.append({"params": lora_params, "lr": gate_lora_lr, "weight_decay": args.wd})
-
-            if getattr(args, 'use_linear_lora', False):
-                linear_lora_params = []
-                for name, module in qlayer.named_modules():
-                    if isinstance(module, QuantLinear):
-                        linear_lora_params.extend(module.get_lora_parameters())
-                if linear_lora_params:
-                    param_groups.append({"params": linear_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-            
-            # Default weight_decay=0 for optimizer (each group specifies its own)
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
-            loss_scaler = utils.NativeScalerWithGradNormCount()
-            
-            # Collect all trainable parameters for gradient clipping
-            # Start with quantization parameters (LET/LWC)
-            clip_parameters = list(get_omni_parameters(qlayer, use_shift))
-            
-            # Add shared_expert_gate parameters if training is enabled
-            if train_shared_gate:
-                for name, module in qlayer.named_modules():
-                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
-                        clip_parameters.extend([p for p in module.parameters() if p.requires_grad])
-            
-            # Add LoRA parameters if training is enabled
-            if train_gate_lora:
-                for name, module in qlayer.named_modules():
-                    if isinstance(module, LoraLinear):
-                        clip_parameters.extend([module.lora_A, module.lora_B])
-
-            if getattr(args, 'use_linear_lora', False):
-                for name, module in qlayer.named_modules():
-                    if isinstance(module, QuantLinear):
-                        clip_parameters.extend(module.get_lora_parameters())
-            
-            # Log training configuration once per block (first layer only)
-            if i == 0:
+            if use_decoupled_moe_training:
+                final_loss = train_decoupled_moe_layer(
+                    layer,
+                    qlayer,
+                    args,
+                    logger,
+                    i,
+                    current_fp_layer_inputs,
+                    quant_inps,
+                    layer_kwargs,
+                    attention_mask_batch,
+                    attention_mask,
+                    position_ids,
+                    traincast,
+                    quant_routing_top_n,
+                    use_router_weight_in_loss,
+                )
+            else:
+                with torch.no_grad():
+                    qlayer.float()      # required for AMP training
+                # create optimizer with parameter groups
+                # LET/LWC parameters use weight_decay=0 (fixed, not controlled by args.wd)
+                param_groups = [
+                    {"params": let_parameters(qlayer, use_shift), "lr": args.let_lr, "weight_decay": 0},
+                    {"params": lwc_parameters(qlayer), "lr": args.lwc_lr, "weight_decay": 0}
+                ]
+                
+                # Add shared_expert_gate parameters if training is enabled (uses args.wd)
                 if train_shared_gate:
-                    logger.info(f"[Gate Training] shared_expert_gate training ENABLED with lr={shared_gate_lr}")
+                    shared_gate_params = []
+                    for name, module in qlayer.named_modules():
+                        if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                            shared_gate_params.extend([p for p in module.parameters() if p.requires_grad])
+                    if shared_gate_params:
+                        param_groups.append({"params": shared_gate_params, "lr": shared_gate_lr, "weight_decay": args.wd})
+                
+                # Add LoRA parameters if training is enabled (uses args.wd)
                 if train_gate_lora:
-                    logger.info(f"[Gate Training] router gate LoRA training ENABLED with r={lora_r}, alpha={lora_alpha}, lr={gate_lora_lr}")
-                if getattr(args, 'use_linear_lora', False):
-                    logger.info(f"[Linear LoRA] QuantLinear LoRA ENABLED with r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr}")
-                if not train_shared_gate and not train_gate_lora and not getattr(args, 'use_linear_lora', False):
-                    logger.info("[Gate Training] All gate training DISABLED (default behavior)")
-            
-            for epochs in range(args.epochs):
-                loss_list = []
-                norm_list = []
-                for j in range(args.nsamples//args.batch_size):    
-                    index = j * args.batch_size
-                    # obtain output of quantization model
-                    with traincast():
-                        smooth_and_quant_temporary(qlayer, args, is_llama)
-                        quant_out = extract_hidden_states(call_layer_forward(
-                            qlayer,
-                            quant_inps[index:index+args.batch_size,],
-                            layer_kwargs=layer_kwargs,
-                            attention_mask=attention_mask_batch,
-                            position_ids=position_ids
-                        ))
-                        loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
-                        if args.aug_loss:
-                            loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-                    if not math.isfinite(loss.item()):
-                        logger.info("Loss is NAN, stopping training")
-                        pdb.set_trace()
-                        
-                    loss_list.append(loss.detach().cpu())
-                    optimizer.zero_grad()
-                    # Use complete parameter list for gradient clipping
-                    norm = loss_scaler(loss, optimizer, parameters=clip_parameters).cpu()
-                    norm_list.append(norm.data)
+                    lora_params = []
+                    for name, module in qlayer.named_modules():
+                        if isinstance(module, LoraLinear):
+                            lora_params.extend([module.lora_A, module.lora_B])
+                    if lora_params:
+                        param_groups.append({"params": lora_params, "lr": gate_lora_lr, "weight_decay": args.wd})
 
-                loss_mean = torch.stack(loss_list).mean()
-                norm_mean = torch.stack(norm_list).mean()
+                if getattr(args, 'use_linear_lora', False):
+                    linear_lora_params = []
+                    for name, module in qlayer.named_modules():
+                        if isinstance(module, QuantLinear):
+                            linear_lora_params.extend(module.get_lora_parameters())
+                    if linear_lora_params:
+                        param_groups.append({"params": linear_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
                 
-                # Calculate and log gate training gradient norms
-                gate_grad_info = ""
-                shared_gate_grad_norm = 0.0
-                lora_grad_norm = 0.0
-                linear_lora_grad_norm = 0.0
+                # Default weight_decay=0 for optimizer (each group specifies its own)
+                optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
+                loss_scaler = utils.NativeScalerWithGradNormCount()
                 
+                # Collect all trainable parameters for gradient clipping
+                # Start with quantization parameters (LET/LWC)
+                clip_parameters = list(get_omni_parameters(qlayer, use_shift))
+                
+                # Add shared_expert_gate parameters if training is enabled
                 if train_shared_gate:
                     for name, module in qlayer.named_modules():
                         if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
-                            if module.weight.grad is not None:
-                                shared_gate_grad_norm += module.weight.grad.norm().item() ** 2
-                    shared_gate_grad_norm = shared_gate_grad_norm ** 0.5
-                    gate_grad_info += f" shared_gate_grad:{shared_gate_grad_norm:.2e}"
+                            clip_parameters.extend([p for p in module.parameters() if p.requires_grad])
                 
+                # Add LoRA parameters if training is enabled
                 if train_gate_lora:
                     for name, module in qlayer.named_modules():
                         if isinstance(module, LoraLinear):
-                            if module.lora_A.grad is not None:
-                                lora_grad_norm += module.lora_A.grad.norm().item() ** 2
-                            if module.lora_B.grad is not None:
-                                lora_grad_norm += module.lora_B.grad.norm().item() ** 2
-                    lora_grad_norm = lora_grad_norm ** 0.5
-                    gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
+                            clip_parameters.extend([module.lora_A, module.lora_B])
 
                 if getattr(args, 'use_linear_lora', False):
                     for name, module in qlayer.named_modules():
                         if isinstance(module, QuantLinear):
-                            for param in module.get_lora_parameters():
-                                if param.grad is not None:
-                                    linear_lora_grad_norm += param.grad.norm().item() ** 2
-                    linear_lora_grad_norm = linear_lora_grad_norm ** 0.5
-                    gate_grad_info += f" linear_lora_grad:{linear_lora_grad_norm:.2e}"
+                            clip_parameters.extend(module.get_lora_parameters())
                 
-                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
-                final_loss = loss_mean.item()  # always update; after loop ends this holds last layer's last epoch loss
-                
-                # WandB logging: Log metrics with strict naming schema for Router Collapse detection
-                if wandb is not None:
-                    # Extract learning rates from optimizer param_groups
-                    lr_shared_gate = None
-                    lr_router_lora = None
-                    lr_linear_lora = None
-                    for pg in optimizer.param_groups:
-                        # Identify groups by checking if they contain shared_gate or lora params
-                        if len(pg['params']) > 0:
-                            # Check if this is the shared gate group (3rd group, index 2)
-                            if train_shared_gate and lr_shared_gate is None:
-                                for name, module in qlayer.named_modules():
-                                    if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
-                                        for p in module.parameters():
-                                            if p.requires_grad and any(p is pp for pp in pg['params']):
-                                                lr_shared_gate = pg['lr']
-                                                break
-                            # Check if this is the lora group (4th group, index 3)
-                            if train_gate_lora and lr_router_lora is None:
-                                for name, module in qlayer.named_modules():
-                                    if isinstance(module, LoraLinear):
-                                        if any(module.lora_A is pp or module.lora_B is pp for pp in pg['params']):
-                                            lr_router_lora = pg['lr']
-                                            break
-                            if getattr(args, 'use_linear_lora', False) and lr_linear_lora is None:
-                                for name, module in qlayer.named_modules():
-                                    if isinstance(module, QuantLinear):
-                                        if any(param is pp for param in module.get_lora_parameters() for pp in pg['params']):
-                                            lr_linear_lora = pg['lr']
-                                            break
-                    
-                    # Build metrics dict with strict naming schema
-                    wandb_metrics = {
-                        "train/loss": loss_mean.item(),
-                        "train/layer_id": i,
-                        "train/epoch": epochs,
-                        "train/grad_norm_mean": norm_mean.item(),
-                    }
-                    
-                    # Add gradient norms for Router Collapse detection
+                # Log training configuration once per block (first layer only)
+                if i == 0:
                     if train_shared_gate:
-                        wandb_metrics["grad/shared_expert_norm"] = shared_gate_grad_norm
+                        logger.info(f"[Gate Training] shared_expert_gate training ENABLED with lr={shared_gate_lr}")
                     if train_gate_lora:
-                        wandb_metrics["grad/router_lora_norm"] = lora_grad_norm
+                        logger.info(f"[Gate Training] router gate LoRA training ENABLED with r={lora_r}, alpha={lora_alpha}, lr={gate_lora_lr}")
                     if getattr(args, 'use_linear_lora', False):
-                        wandb_metrics["grad/linear_lora_norm"] = linear_lora_grad_norm
+                        logger.info(f"[Linear LoRA] QuantLinear LoRA ENABLED with r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr}")
+                    if not train_shared_gate and not train_gate_lora and not getattr(args, 'use_linear_lora', False):
+                        logger.info("[Gate Training] All gate training DISABLED (default behavior)")
+                
+                for epochs in range(args.epochs):
+                    loss_list = []
+                    norm_list = []
+                    for j in range(args.nsamples//args.batch_size):    
+                        index = j * args.batch_size
+                        # obtain output of quantization model
+                        with traincast():
+                            smooth_and_quant_temporary(qlayer, args, is_llama)
+                            quant_out = extract_hidden_states(call_layer_forward(
+                                qlayer,
+                                quant_inps[index:index+args.batch_size,],
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask_batch,
+                                position_ids=position_ids
+                            ))
+                            loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                            if args.aug_loss:
+                                loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+                        if not math.isfinite(loss.item()):
+                            logger.info("Loss is NAN, stopping training")
+                            pdb.set_trace()
+                            
+                        loss_list.append(loss.detach().cpu())
+                        optimizer.zero_grad()
+                        # Use complete parameter list for gradient clipping
+                        norm = loss_scaler(loss, optimizer, parameters=clip_parameters).cpu()
+                        norm_list.append(norm.data)
+
+                    loss_mean = torch.stack(loss_list).mean()
+                    norm_mean = torch.stack(norm_list).mean()
                     
-                    # Add learning rates for hyperparameter tracking
-                    if lr_shared_gate is not None:
-                        wandb_metrics["lr/shared_gate"] = lr_shared_gate
-                    if lr_router_lora is not None:
-                        wandb_metrics["lr/router_lora"] = lr_router_lora
-                    if lr_linear_lora is not None:
-                        wandb_metrics["lr/linear_lora"] = lr_linear_lora
-                    if calibrate_router:
-                        wandb_metrics["lr/router_lr"] = router_lr
+                    # Calculate and log gate training gradient norms
+                    gate_grad_info = ""
+                    shared_gate_grad_norm = 0.0
+                    lora_grad_norm = 0.0
+                    linear_lora_grad_norm = 0.0
                     
-                    wandb.log(wandb_metrics, step=global_step)
-                    global_step += 1
-            clear_temp_variable(qlayer)
-            del optimizer
-            
-            # Merge LoRA weights back into original Linear layers after training
-            if train_gate_lora:
-                for name, module in list(qlayer.named_modules()):
-                    if isinstance(module, LoraLinear):
-                        merged_linear = module.merge()
-                        add_new_module(name, qlayer, merged_linear)
-                        logger.info(f"Merged LoRA weights for {name}")
+                    if train_shared_gate:
+                        for name, module in qlayer.named_modules():
+                            if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                                if module.weight.grad is not None:
+                                    shared_gate_grad_norm += module.weight.grad.norm().item() ** 2
+                        shared_gate_grad_norm = shared_gate_grad_norm ** 0.5
+                        gate_grad_info += f" shared_gate_grad:{shared_gate_grad_norm:.2e}"
+                    
+                    if train_gate_lora:
+                        for name, module in qlayer.named_modules():
+                            if isinstance(module, LoraLinear):
+                                if module.lora_A.grad is not None:
+                                    lora_grad_norm += module.lora_A.grad.norm().item() ** 2
+                                if module.lora_B.grad is not None:
+                                    lora_grad_norm += module.lora_B.grad.norm().item() ** 2
+                        lora_grad_norm = lora_grad_norm ** 0.5
+                        gate_grad_info += f" lora_grad:{lora_grad_norm:.2e}"
+
+                    if getattr(args, 'use_linear_lora', False):
+                        for name, module in qlayer.named_modules():
+                            if isinstance(module, QuantLinear):
+                                for param in module.get_lora_parameters():
+                                    if param.grad is not None:
+                                        linear_lora_grad_norm += param.grad.norm().item() ** 2
+                        linear_lora_grad_norm = linear_lora_grad_norm ** 0.5
+                        gate_grad_info += f" linear_lora_grad:{linear_lora_grad_norm:.2e}"
+                    
+                    logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean}{gate_grad_info} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                    final_loss = loss_mean.item()  # always update; after loop ends this holds last layer's last epoch loss
+                    
+                    # WandB logging: Log metrics with strict naming schema for Router Collapse detection
+                    if wandb is not None:
+                        # Extract learning rates from optimizer param_groups
+                        lr_shared_gate = None
+                        lr_router_lora = None
+                        lr_linear_lora = None
+                        for pg in optimizer.param_groups:
+                            # Identify groups by checking if they contain shared_gate or lora params
+                            if len(pg['params']) > 0:
+                                # Check if this is the shared gate group (3rd group, index 2)
+                                if train_shared_gate and lr_shared_gate is None:
+                                    for name, module in qlayer.named_modules():
+                                        if name.endswith("shared_expert_gate") and isinstance(module, nn.Linear):
+                                            for p in module.parameters():
+                                                if p.requires_grad and any(p is pp for pp in pg['params']):
+                                                    lr_shared_gate = pg['lr']
+                                                    break
+                                # Check if this is the lora group (4th group, index 3)
+                                if train_gate_lora and lr_router_lora is None:
+                                    for name, module in qlayer.named_modules():
+                                        if isinstance(module, LoraLinear):
+                                            if any(module.lora_A is pp or module.lora_B is pp for pp in pg['params']):
+                                                lr_router_lora = pg['lr']
+                                                break
+                                if getattr(args, 'use_linear_lora', False) and lr_linear_lora is None:
+                                    for name, module in qlayer.named_modules():
+                                        if isinstance(module, QuantLinear):
+                                            if any(param is pp for param in module.get_lora_parameters() for pp in pg['params']):
+                                                lr_linear_lora = pg['lr']
+                                                break
+                        
+                        # Build metrics dict with strict naming schema
+                        wandb_metrics = {
+                            "train/loss": loss_mean.item(),
+                            "train/layer_id": i,
+                            "train/epoch": epochs,
+                            "train/grad_norm_mean": norm_mean.item(),
+                        }
+                        
+                        # Add gradient norms for Router Collapse detection
+                        if train_shared_gate:
+                            wandb_metrics["grad/shared_expert_norm"] = shared_gate_grad_norm
+                        if train_gate_lora:
+                            wandb_metrics["grad/router_lora_norm"] = lora_grad_norm
+                        if getattr(args, 'use_linear_lora', False):
+                            wandb_metrics["grad/linear_lora_norm"] = linear_lora_grad_norm
+                        
+                        # Add learning rates for hyperparameter tracking
+                        if lr_shared_gate is not None:
+                            wandb_metrics["lr/shared_gate"] = lr_shared_gate
+                        if lr_router_lora is not None:
+                            wandb_metrics["lr/router_lora"] = lr_router_lora
+                        if lr_linear_lora is not None:
+                            wandb_metrics["lr/linear_lora"] = lr_linear_lora
+                        if calibrate_router:
+                            wandb_metrics["lr/router_lr"] = router_lr
+                        
+                        wandb.log(wandb_metrics, step=global_step)
+                        global_step += 1
+                clear_temp_variable(qlayer)
+                del optimizer
+                
+                # Merge LoRA weights back into original Linear layers after training
+                if train_gate_lora:
+                    for name, module in list(qlayer.named_modules()):
+                        if isinstance(module, LoraLinear):
+                            merged_linear = module.merge()
+                            add_new_module(name, qlayer, merged_linear)
+                            logger.info(f"Merged LoRA weights for {name}")
+
+        if args.epochs > 0 and train_gate_lora and use_decoupled_moe_training:
+            for name, module in list(qlayer.named_modules()):
+                if isinstance(module, LoraLinear):
+                    merged_linear = module.merge()
+                    add_new_module(name, qlayer, merged_linear)
+                    logger.info(f"Merged LoRA weights for {name}")
+
+        if args.epochs > 0 and use_decoupled_moe_training:
+            set_quant_state(qlayer, weight_quant=False, act_quant=False)
+            with torch.no_grad():
+                with torch.amp.autocast('cuda'):
+                    for j in range(args.nsamples):
+                        fp_inps[j] = extract_hidden_states(call_layer_forward(
+                            layer,
+                            current_fp_layer_inputs[j].unsqueeze(0),
+                            layer_kwargs=layer_kwargs,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids
+                        ))
+                        if args.aug_loss:
+                            fp_inps_2[j] = extract_hidden_states(call_layer_forward(
+                                qlayer,
+                                quant_inps[j].unsqueeze(0),
+                                layer_kwargs=layer_kwargs,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids
+                            ))
         
         # =================================================================
         # Post-LWC Expert Shift Check (always for Qwen MoE)
