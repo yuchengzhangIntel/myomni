@@ -117,7 +117,12 @@ def is_packed_experts_module(module: nn.Module) -> bool:
 
 
 def get_moe_top_k(moe_module: nn.Module) -> int | None:
-    return getattr(moe_module, "top_k", None)
+    top_k = getattr(moe_module, "top_k", None)
+    if top_k is not None:
+        return top_k
+
+    gate_module = getattr(moe_module, "gate", None)
+    return getattr(gate_module, "top_k", None)
 
 
 def get_shared_expert_module(moe_module: nn.Module) -> nn.Module | None:
@@ -157,8 +162,16 @@ def compute_expert_down_proj_output(
     expert_idx: int,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    if isinstance(experts_module, nn.ModuleList):
+        return experts_module[expert_idx](hidden_states)
+
     if hasattr(experts_module, "experts") and isinstance(experts_module.experts, nn.ModuleList):
         return experts_module.experts[expert_idx](hidden_states)
+
+    if not (hasattr(experts_module, "gate_up_proj") and hasattr(experts_module, "down_proj")):
+        raise TypeError(
+            f"Unsupported MoE experts module type: {type(experts_module).__name__}"
+        )
 
     gate_up_weight = experts_module.gate_up_proj[expert_idx]
     down_proj_weight = experts_module.down_proj[expert_idx]

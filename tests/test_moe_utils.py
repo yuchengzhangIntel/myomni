@@ -13,6 +13,7 @@ from quantize.moe_utils import (  # noqa: E402
     QuantizedPackedExperts,
     compute_expert_down_proj_output,
     compute_router_scores,
+    get_moe_top_k,
     pin_cpu_tensor,
     select_top_n_experts,
 )
@@ -64,6 +65,26 @@ class FakePackedExperts(nn.Module):
         ]))
 
 
+class FakeQwen2Expert(nn.Module):
+    def __init__(self, gate_weight, up_weight, down_weight):
+        super().__init__()
+        hidden_size = gate_weight.shape[1]
+        intermediate_size = gate_weight.shape[0]
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = F.silu
+
+        with torch.no_grad():
+            self.gate_proj.weight.copy_(gate_weight)
+            self.up_proj.weight.copy_(up_weight)
+            self.down_proj.weight.copy_(down_weight)
+
+    def forward(self, hidden_states):
+        gated = self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        return self.down_proj(gated)
+
+
 def test_quantized_packed_experts_matches_packed_forward():
     packed = FakePackedExperts()
     quantized = QuantizedPackedExperts(packed, build_args())
@@ -108,6 +129,43 @@ def test_router_score_selection_normalizes_top_n_weights():
     assert torch.allclose(top_weights.sum(dim=-1), torch.ones(2))
     assert top_indices[0].tolist() == [2, 1]
     assert top_indices[1].tolist() == [0, 2]
+
+
+def test_get_moe_top_k_reads_router_top_k_when_block_has_no_top_k():
+    class FakeTopKRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.top_k = 4
+
+        def forward(self, hidden_states):
+            probs = torch.softmax(torch.ones(hidden_states.shape[0], 8, device=hidden_states.device), dim=-1)
+            indices = torch.zeros(hidden_states.shape[0], self.top_k, dtype=torch.long, device=hidden_states.device)
+            return probs, probs[:, : self.top_k], indices
+
+    moe = SimpleNamespace(gate=FakeTopKRouter())
+
+    assert get_moe_top_k(moe) == 4
+
+
+def test_compute_expert_down_proj_output_supports_modulelist_experts():
+    experts = nn.ModuleList([
+        FakeQwen2Expert(
+            gate_weight=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+            up_weight=torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0]]),
+            down_weight=torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.25, 0.25]]),
+        ),
+        FakeQwen2Expert(
+            gate_weight=torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+            up_weight=torch.tensor([[0.0, 0.5, 0.0], [0.0, 0.0, 0.5]]),
+            down_weight=torch.tensor([[0.5, 0.0], [0.0, 0.5], [1.0, 1.0]]),
+        ),
+    ])
+    hidden_states = torch.tensor([[0.0, 1.0, 3.0]], dtype=torch.float32)
+
+    actual = compute_expert_down_proj_output(experts, 1, hidden_states)
+    expected = experts[1](hidden_states)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
 
 
 def test_moe_self_supervision_loss_handles_experts_and_shared_expert():
