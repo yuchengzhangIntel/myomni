@@ -17,7 +17,7 @@ from quantize.moe_utils import (  # noqa: E402
     pin_cpu_tensor,
     select_top_n_experts,
 )
-from quantize.omniquant import compute_moe_self_supervision_loss  # noqa: E402
+from quantize.omniquant import compute_moe_self_supervision_loss, get_attention_epochs  # noqa: E402
 
 
 def build_args():
@@ -166,6 +166,11 @@ def test_compute_expert_down_proj_output_supports_modulelist_experts():
     expected = experts[1](hidden_states)
 
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_get_attention_epochs_defaults_to_global_epochs_and_allows_override():
+    assert get_attention_epochs(SimpleNamespace(epochs=12)) == 12
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3)) == 3
 
 
 def test_moe_self_supervision_loss_handles_experts_and_shared_expert():

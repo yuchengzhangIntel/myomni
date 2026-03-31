@@ -162,6 +162,10 @@ def resolve_quant_routing_top_n(moe_module, requested_top_n):
     return requested_top_n
 
 
+def get_attention_epochs(args):
+    return getattr(args, "attn_epochs", args.epochs)
+
+
 def build_moe_label_cache(layer, fp_inputs, layer_kwargs, attention_mask, position_ids, top_n):
     label_cache = []
     shared_expert = get_shared_expert_module(layer.mlp)
@@ -289,6 +293,7 @@ def train_decoupled_moe_layer(
     qlayer.float()
     final_stage_loss = None
     loss_func = torch.nn.MSELoss()
+    attn_epochs = get_attention_epochs(args)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
 
@@ -303,12 +308,12 @@ def train_decoupled_moe_layer(
     if attn_lora_params:
         attn_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
 
-    if attn_param_groups and args.epochs > 0:
-        logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {args.epochs} epochs")
+    if attn_param_groups and attn_epochs > 0:
+        logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {attn_epochs} epochs")
         attn_optimizer = torch.optim.AdamW(attn_param_groups, weight_decay=0)
         attn_scaler = utils.NativeScalerWithGradNormCount()
         attn_clip_params = attn_lwc_params + attn_lora_params
-        for epoch in range(args.epochs):
+        for epoch in range(attn_epochs):
             loss_list = []
             norm_list = []
             for start in range(0, args.nsamples, args.batch_size):
@@ -513,7 +518,9 @@ def omniquant(
     
     
     layers[0] = layers[0].to(dev)
-    if args.deactive_amp and args.epochs>0:
+    attn_epochs = get_attention_epochs(args)
+    has_any_training_epochs = args.epochs > 0 or attn_epochs > 0
+    if args.deactive_amp and has_any_training_epochs:
         dtype = torch.float
         traincast = nullcontext
     else:
@@ -662,6 +669,7 @@ def omniquant(
             and hasattr(layer, "mlp")
             and get_moe_experts_module(layer.mlp) is not None
         )
+        train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and attn_epochs > 0)
 
         # =================================================================
         # Legacy Expert Shift Tracking for Router Calibration
@@ -946,7 +954,7 @@ def omniquant(
             qlayer.load_state_dict(omni_parameters[i], strict=False)
         
 
-        if args.epochs > 0:
+        if train_current_layer:
             if use_decoupled_moe_training:
                 final_loss = train_decoupled_moe_layer(
                     layer,
@@ -1173,14 +1181,14 @@ def omniquant(
                             add_new_module(name, qlayer, merged_linear)
                             logger.info(f"Merged LoRA weights for {name}")
 
-        if args.epochs > 0 and train_gate_lora and use_decoupled_moe_training:
+        if train_current_layer and train_gate_lora and use_decoupled_moe_training:
             for name, module in list(qlayer.named_modules()):
                 if isinstance(module, LoraLinear):
                     merged_linear = module.merge()
                     add_new_module(name, qlayer, merged_linear)
                     logger.info(f"Merged LoRA weights for {name}")
 
-        if args.epochs > 0 and use_decoupled_moe_training:
+        if train_current_layer and use_decoupled_moe_training:
             set_quant_state(qlayer, weight_quant=False, act_quant=False)
             with torch.no_grad():
                 with torch.amp.autocast('cuda'):
@@ -1279,7 +1287,7 @@ def omniquant(
         qlayer.half() 
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
-        if args.epochs>0:
+        if train_current_layer:
             # update input of quantization model
             with torch.no_grad():
                 # with torch.cuda.amp.autocast():

@@ -381,6 +381,8 @@ def main():
     parser.add_argument("--lwc_lr", type=float, default=1e-2)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--attn_epochs", type=int, default=None,
+                        help="Override the number of training epochs used by the decoupled attention stage; defaults to --epochs")
     parser.add_argument("--let", default=False, action="store_true",
                         help="activate learnable equivalent transformation")
     parser.add_argument("--lwc", default=False, action="store_true", help="activate learnable weight clipping")
@@ -454,13 +456,19 @@ def main():
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
 
     args = parser.parse_args()
+    if args.attn_epochs is None:
+        args.attn_epochs = args.epochs
+    if args.epochs < 0:
+        raise ValueError("--epochs must be non-negative")
+    if args.attn_epochs < 0:
+        raise ValueError("--attn_epochs must be non-negative")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
 
     # check
-    if args.epochs > 0:
+    if args.epochs > 0 or args.attn_epochs > 0:
         assert args.lwc or args.let
 
     if args.use_linear_lora and args.let:
@@ -501,6 +509,7 @@ def main():
     logger.info("Training Configuration Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
+    logger.info(f"  Attention Epochs          : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
@@ -663,6 +672,7 @@ def main():
     logger.info("Final Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
+    logger.info(f"  Attention Epochs          : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
