@@ -131,6 +131,39 @@ def _get_batch_attention_mask(attention_mask_batch, start: int, end: int):
     return attention_mask_batch[: end - start]
 
 
+def _align_router_logits_for_teacher(router_logits: torch.Tensor, teacher_indices: torch.Tensor, logger=None):
+    """
+    Align router logits to [batch, seq, experts] to match teacher top-k labels.
+
+    Some MoE implementations emit router logits as flattened [batch*seq, experts].
+    """
+    if router_logits is None:
+        return None
+
+    if router_logits.dim() == 3:
+        return router_logits
+
+    if router_logits.dim() != 2:
+        return router_logits
+
+    if teacher_indices is None or teacher_indices.dim() != 3:
+        return router_logits.unsqueeze(0)
+
+    batch_size, seq_len, _ = teacher_indices.shape
+    flat_tokens, num_experts = router_logits.shape
+
+    if batch_size > 0 and flat_tokens == batch_size * seq_len:
+        return router_logits.reshape(batch_size, seq_len, num_experts)
+
+    if logger is not None:
+        logger.warning(
+            "[BlockUpdate] Router logits shape mismatch: student=%s teacher=%s; fallback to unsqueeze(0)",
+            tuple(router_logits.shape),
+            tuple(teacher_indices.shape),
+        )
+    return router_logits.unsqueeze(0)
+
+
 def evaluate_block_loss_modes(
     qlayer,
     args,
@@ -277,8 +310,7 @@ def update_block_parameters_with_loss(
                     if aux_enabled and teacher_router_labels is not None and router_logits is not None:
                         teacher_logits = teacher_router_labels[0][start:end, :, :aux_topk]
                         teacher_indices = teacher_router_labels[1][start:end, :, :aux_topk]
-                        if router_logits.dim() == 2:
-                            router_logits = router_logits.unsqueeze(0)
+                        router_logits = _align_router_logits_for_teacher(router_logits, teacher_indices, logger=logger)
                         aux_loss = compute_topk_mse_loss(router_logits.float(), teacher_logits, teacher_indices)
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
