@@ -87,40 +87,67 @@ def capture_teacher_router_labels(
     )
 
 
-def _build_forced_router_logits(router_output: torch.Tensor, teacher_indices: torch.Tensor) -> torch.Tensor:
+def _build_forced_router_logits(
+    router_output: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_indices: torch.Tensor,
+) -> torch.Tensor:
     if router_output.dim() not in (2, 3):
         return router_output
 
     forced_logits = torch.full_like(router_output, -10000.0)
-    if teacher_indices.numel() == 0:
+    if teacher_indices is None or teacher_indices.numel() == 0:
+        return forced_logits
+
+    if teacher_logits is None or teacher_logits.numel() == 0:
         return forced_logits
 
     if router_output.dim() == 2:
         forced_indices = teacher_indices.reshape(-1, teacher_indices.shape[-1]).to(router_output.device)
-        k = min(forced_indices.shape[-1], router_output.shape[-1])
+        forced_values = teacher_logits.reshape(-1, teacher_logits.shape[-1]).to(
+            device=router_output.device,
+            dtype=router_output.dtype,
+        )
+
+        token_count = min(router_output.shape[0], forced_indices.shape[0], forced_values.shape[0])
+        if token_count <= 0:
+            return forced_logits
+
+        k = min(forced_indices.shape[-1], forced_values.shape[-1], router_output.shape[-1])
         if k <= 0:
             return forced_logits
-        ranks = torch.arange(k, 0, -1, device=router_output.device, dtype=router_output.dtype)
-        forced_logits.scatter_(-1, forced_indices[:, :k], ranks.unsqueeze(0).expand(forced_indices.shape[0], -1))
+
+        forced_values = forced_values[:token_count, :k]
+        forced_values = forced_values - forced_values.max(dim=-1, keepdim=True).values
+        forced_logits[:token_count].scatter_(-1, forced_indices[:token_count, :k], forced_values)
         return forced_logits
 
     forced_indices = teacher_indices.to(router_output.device)
-    k = min(forced_indices.shape[-1], router_output.shape[-1])
+    forced_values = teacher_logits.to(device=router_output.device, dtype=router_output.dtype)
+
+    batch_size = min(router_output.shape[0], forced_indices.shape[0], forced_values.shape[0])
+    seq_len = min(router_output.shape[1], forced_indices.shape[1], forced_values.shape[1])
+    if batch_size <= 0 or seq_len <= 0:
+        return forced_logits
+
+    k = min(forced_indices.shape[-1], forced_values.shape[-1], router_output.shape[-1])
     if k <= 0:
         return forced_logits
 
-    ranks = torch.arange(k, 0, -1, device=router_output.device, dtype=router_output.dtype)
-    forced_logits.scatter_(
+    forced_indices = forced_indices[:batch_size, :seq_len, :k]
+    forced_values = forced_values[:batch_size, :seq_len, :k]
+    forced_values = forced_values - forced_values.max(dim=-1, keepdim=True).values
+    forced_logits[:batch_size, :seq_len].scatter_(
         -1,
-        forced_indices[..., :k],
-        ranks.view(1, 1, -1).expand(forced_indices.shape[0], forced_indices.shape[1], -1),
+        forced_indices,
+        forced_values,
     )
     return forced_logits
 
 
-def _teacher_forcing_hook_factory(teacher_indices_batch: torch.Tensor):
+def _teacher_forcing_hook_factory(teacher_logits_batch: torch.Tensor, teacher_indices_batch: torch.Tensor):
     def _hook(_module, _inputs, output):
-        return _build_forced_router_logits(output, teacher_indices_batch)
+        return _build_forced_router_logits(output, teacher_logits_batch, teacher_indices_batch)
 
     return _hook
 
@@ -202,8 +229,11 @@ def evaluate_block_loss_modes(
                 batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
                 gate_hook = None
                 if mode == "teacher_forcing":
+                    teacher_logits = teacher_router_labels[0][start:end, :, :teacher_forcing_topk]
                     teacher_indices = teacher_router_labels[1][start:end, :, :teacher_forcing_topk]
-                    gate_hook = qlayer.mlp.gate.register_forward_hook(_teacher_forcing_hook_factory(teacher_indices))
+                    gate_hook = qlayer.mlp.gate.register_forward_hook(
+                        _teacher_forcing_hook_factory(teacher_logits, teacher_indices)
+                    )
 
                 try:
                     with traincast():
@@ -310,8 +340,9 @@ def update_block_parameters_with_loss(
                     if aux_enabled and teacher_router_labels is not None and router_logits is not None:
                         teacher_logits = teacher_router_labels[0][start:end, :, :aux_topk]
                         teacher_indices = teacher_router_labels[1][start:end, :, :aux_topk]
-                        router_logits = _align_router_logits_for_teacher(router_logits, teacher_indices, logger=logger)
-                        aux_loss = compute_topk_mse_loss(router_logits.float(), teacher_logits, teacher_indices)
+                        aligned_router_logits = _align_router_logits_for_teacher(router_logits, teacher_indices, logger=logger)
+                        if aligned_router_logits is not None:
+                            aux_loss = compute_topk_mse_loss(aligned_router_logits.float(), teacher_logits, teacher_indices)
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
 
