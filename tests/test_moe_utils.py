@@ -171,6 +171,11 @@ def test_compute_expert_down_proj_output_supports_modulelist_experts():
 def test_get_attention_epochs_defaults_to_global_epochs_and_allows_override():
     assert get_attention_epochs(SimpleNamespace(epochs=12)) == 12
     assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3)) == 3
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=0) == 3
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=1) == 3
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=2) == 4
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=5) == 5
+    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=0), layer_idx=6) == 0
 
 
 def test_moe_self_supervision_loss_handles_experts_and_shared_expert():

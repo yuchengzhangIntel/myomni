@@ -162,8 +162,11 @@ def resolve_quant_routing_top_n(moe_module, requested_top_n):
     return requested_top_n
 
 
-def get_attention_epochs(args):
-    return getattr(args, "attn_epochs", args.epochs)
+def get_attention_epochs(args, layer_idx=None):
+    base_attn_epochs = getattr(args, "attn_epochs", args.epochs)
+    if base_attn_epochs <= 0 or layer_idx is None:
+        return base_attn_epochs
+    return base_attn_epochs + max(layer_idx, 0) // 2
 
 
 def build_moe_label_cache(layer, fp_inputs, layer_kwargs, attention_mask, position_ids, top_n):
@@ -294,7 +297,7 @@ def train_decoupled_moe_layer(
     qlayer.float()
     final_stage_loss = None
     loss_func = torch.nn.MSELoss()
-    attn_epochs = get_attention_epochs(args)
+    attn_epochs = get_attention_epochs(args, layer_idx)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
 
@@ -670,7 +673,8 @@ def omniquant(
             and hasattr(layer, "mlp")
             and get_moe_experts_module(layer.mlp) is not None
         )
-        train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and attn_epochs > 0)
+        layer_attn_epochs = get_attention_epochs(args, i)
+        train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and layer_attn_epochs > 0)
 
         # =================================================================
         # Legacy Expert Shift Tracking for Router Calibration

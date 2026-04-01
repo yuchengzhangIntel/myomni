@@ -382,7 +382,7 @@ def main():
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--attn_epochs", type=int, default=None,
-                        help="Override the number of training epochs used by the decoupled attention stage; defaults to --epochs")
+                        help="Base epoch count for decoupled attention training; defaults to --epochs and increases by 1 every 2 layers")
     parser.add_argument("--let", default=False, action="store_true",
                         help="activate learnable equivalent transformation")
     parser.add_argument("--lwc", default=False, action="store_true", help="activate learnable weight clipping")
@@ -509,7 +509,7 @@ def main():
     logger.info("Training Configuration Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
-    logger.info(f"  Attention Epochs          : {args.attn_epochs}")
+    logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
@@ -672,7 +672,7 @@ def main():
     logger.info("Final Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
-    logger.info(f"  Attention Epochs          : {args.attn_epochs}")
+    logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
