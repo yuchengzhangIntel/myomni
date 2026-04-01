@@ -1,4 +1,16 @@
 import os
+
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+os.environ["windows_host"] = "http://child-prc.intel.com"
+os.environ["HTTP_PROXY"] = f"{os.environ['windows_host']}:913"
+os.environ["ALL_PROXY"] = f"{os.environ['windows_host']}:913"
+os.environ["http_proxy"] = os.environ["HTTP_PROXY"]
+os.environ["HTTPS_PROXY"] = os.environ["HTTP_PROXY"]
+os.environ["https_proxy"] = os.environ["HTTP_PROXY"]
+os.environ["no_proxy"] = "localhost,127.0.0.1"
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
 import sys
 import random
 from numbers import Number
