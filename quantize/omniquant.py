@@ -251,18 +251,19 @@ def compute_moe_self_supervision_loss(
             if use_router_weight_in_loss:
                 weights = cached_values["weights"].to(sample_inputs.device, non_blocking=True).float()
                 expert_loss = expert_loss * weights
-            loss_terms.append(expert_loss)
+            loss_terms.append(expert_loss.mean())
 
         if sample_cache["shared_labels"] is not None and shared_expert is not None:
             shared_labels = sample_cache["shared_labels"].to(sample_inputs.device, non_blocking=True)
             student_shared = extract_hidden_states(call_layer_forward(shared_expert, sample_inputs))
             shared_loss = (student_shared.float() - shared_labels.float()).pow(2).mean(dim=-1)
-            loss_terms.append(shared_loss)
+            loss_terms.append(shared_loss.mean())
 
     if not loss_terms:
-        return torch.tensor(0.0, device=quant_inputs.device, requires_grad=True)
+        loss_device = mlp_inputs.device if precomputed_mlp_inputs is not None else quant_inputs.device
+        return torch.tensor(0.0, device=loss_device, requires_grad=True)
 
-    return torch.cat([term.reshape(-1) for term in loss_terms]).mean()
+    return torch.stack(loss_terms).sum()
 
 
 def train_decoupled_moe_layer(
