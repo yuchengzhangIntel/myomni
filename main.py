@@ -1,6 +1,7 @@
 import os
 import sys
 import random
+from numbers import Number
 import numpy as np
 from models.LMClass import LMClass
 import torch
@@ -454,6 +455,16 @@ def main():
                         help="Top-N experts to cache for MoE self-supervision; defaults to the layer routing top-k")
     parser.add_argument("--use_router_weight_in_loss", default=False, action="store_true",
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
+    parser.add_argument("--block_eval_interval", type=int, default=0,
+                        help="Run block-wise evaluation every N MoE epochs; disabled when < 1")
+    parser.add_argument("--enable_block_loss_update", default=False, action="store_true",
+                        help="Enable post-MoE block-wise update stage (pre-eval -> update -> post-eval)")
+    parser.add_argument("--block_update_epochs", type=int, default=1,
+                        help="Epoch count for post-MoE block-wise update stage")
+    parser.add_argument("--block_aux_loss", default=False, action="store_true",
+                        help="Enable router auxiliary loss to keep quant router close to FP16 routing")
+    parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
+                        help="Weight for router auxiliary loss in block-wise update stage")
 
     args = parser.parse_args()
     if args.attn_epochs is None:
@@ -462,6 +473,10 @@ def main():
         raise ValueError("--epochs must be non-negative")
     if args.attn_epochs < 0:
         raise ValueError("--attn_epochs must be non-negative")
+    if args.block_update_epochs < 0:
+        raise ValueError("--block_update_epochs must be non-negative")
+    if args.block_aux_loss_weight < 0:
+        raise ValueError("--block_aux_loss_weight must be non-negative")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -469,7 +484,21 @@ def main():
 
     # check
     if args.epochs > 0 or args.attn_epochs > 0:
-        assert args.lwc or args.let
+        has_any_trainable_mechanism = any([
+            args.lwc,
+            args.let,
+            args.use_linear_lora,
+            args.train_gate_lora,
+            args.train_shared_gate,
+            args.enable_block_loss_update,
+            args.calibrate_router,
+        ])
+        if not has_any_trainable_mechanism:
+            raise ValueError(
+                "Training epochs are set, but no trainable mechanism is enabled. "
+                "Enable at least one of --lwc, --let, --use_linear_lora, --train_gate_lora, "
+                "--train_shared_gate, --enable_block_loss_update, or --calibrate_router."
+            )
 
     if args.use_linear_lora and args.let:
         raise ValueError("--use_linear_lora is not supported together with --let in this implementation")
@@ -520,6 +549,11 @@ def main():
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
+    logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
+    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
+                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
+    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
+                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info("=" * 60)
 
     if args.enable_wandb:
@@ -683,6 +717,11 @@ def main():
                 + (f"  (lr={args.shared_gate_lr})" if args.train_shared_gate else ""))
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
+    logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
+    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
+                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
+    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
+                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results
     wiki2_ppl = results.get('wikitext2', 'N/A')
@@ -690,7 +729,12 @@ def main():
     logger.info(f"  Wikitext2 PPL             : {wiki2_ppl}")
     logger.info(f"  C4 PPL                    : {c4_ppl}")
     # Task evaluation results
-    task_keys = [k for k in results if k not in ('wikitext2', 'c4')]
+    ppl_keys = {"wikitext2", "c4", "ptb", "ptb-new", "c4-new"}
+    task_keys = [k for k in results if k not in ppl_keys]
+    # Only include numeric task results when computing the mean
+    task_scores = [v for k, v in results.items() if k in task_keys and isinstance(v, (int, float))]
+    task_score_mean = round(sum(task_scores) / len(task_scores), 4) if task_scores else "N/A"
+    logger.info(f"  Task Score Mean           : {task_score_mean}")
     if task_keys:
         logger.info("  Task Evaluation Results:")
         for k in task_keys:

@@ -31,6 +31,12 @@ from quantize.moe_utils import (
     pin_cpu_tensor,
     select_top_n_experts,
 )
+from quantize.block_evaluator import (
+    capture_teacher_router_labels,
+    compute_fp_block_targets,
+    evaluate_block_loss_modes,
+    update_block_parameters_with_loss,
+)
 
 
 class LoraLinear(nn.Module):
@@ -123,6 +129,24 @@ def collect_stage_parameters(module, prefixes, include_linear_lora=False):
             seen.add(id(param))
 
     return lwc_params, linear_lora_params
+
+
+def collect_router_and_shared_gate_parameters(module):
+    router_params = []
+    shared_gate_params = []
+    seen = set()
+
+    for name, param in module.named_parameters():
+        if id(param) in seen:
+            continue
+        if name.startswith("mlp.gate."):
+            router_params.append(param)
+            seen.add(id(param))
+        elif name.startswith("mlp.shared_expert_gate."):
+            shared_gate_params.append(param)
+            seen.add(id(param))
+
+    return router_params, shared_gate_params
 
 
 def compute_attention_outputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
@@ -354,6 +378,51 @@ def train_decoupled_moe_layer(
             final_stage_loss = loss_mean.item()
         del attn_optimizer
 
+    fp_block_targets, fp_block_targets_aug = compute_fp_block_targets(
+        layer,
+        qlayer,
+        args,
+        fp_inps,
+        quant_inps,
+        layer_kwargs,
+        attention_mask,
+        position_ids,
+        traincast,
+    )
+
+    routing_top_k = get_moe_top_k(layer.mlp)
+    if routing_top_k is None:
+        routing_top_k = 1
+    max_experts = None
+    if hasattr(layer.mlp, "gate"):
+        max_experts = getattr(layer.mlp.gate, "out_features", None)
+        if max_experts is None and hasattr(layer.mlp.gate, "weight"):
+            max_experts = layer.mlp.gate.weight.shape[0]
+    teacher_label_topk = max(routing_top_k, getattr(args, "k_loss", routing_top_k))
+    if max_experts is not None:
+        teacher_label_topk = min(teacher_label_topk, int(max_experts))
+    teacher_router_labels = capture_teacher_router_labels(
+        layer,
+        fp_inps,
+        quant_inps.device,
+        layer_kwargs,
+        topk=teacher_label_topk,
+        logger=logger,
+    )
+    if teacher_router_labels is None:
+        logger.warning(
+            f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, teacher-forcing and aux-router loss will be skipped"
+        )
+
+    eval_interval = getattr(args, "block_eval_interval", 0)
+    periodic_eval_enabled = eval_interval >= 1
+    update_stage_enabled = getattr(args, "enable_block_loss_update", False)
+    update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
+    block_aux_enabled = getattr(args, "block_aux_loss", False)
+    block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
+    if block_aux_enabled and teacher_router_labels is None:
+        logger.warning(f"[BlockUpdate] Layer {layer_idx}: block auxiliary router loss requested but teacher labels are unavailable")
+
     top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
     logger.info(f"[Decoupled MoE] Layer {layer_idx}: building CPU label cache with top_n={top_n}")
     label_cache = build_moe_label_cache(
@@ -420,7 +489,142 @@ def train_decoupled_moe_layer(
             norm_mean = torch.stack(norm_list).mean()
             logger.info(f"[Decoupled MoE] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean}")
             final_stage_loss = loss_mean.item()
+
+            if periodic_eval_enabled and (epoch + 1) % eval_interval == 0:
+                evaluate_block_loss_modes(
+                    qlayer=qlayer,
+                    args=args,
+                    loss_func=loss_func,
+                    quant_inputs=quant_inps,
+                    fp_targets=fp_block_targets,
+                    fp_targets_aug=fp_block_targets_aug,
+                    teacher_router_labels=teacher_router_labels,
+                    teacher_forcing_topk=routing_top_k,
+                    layer_kwargs=layer_kwargs,
+                    attention_mask_batch=attention_mask_batch,
+                    position_ids=position_ids,
+                    traincast=traincast,
+                    logger=logger,
+                    layer_idx=layer_idx,
+                    epoch_idx=epoch,
+                    smooth_is_llama=True,
+                )
         del moe_optimizer
+
+    if update_stage_enabled:
+        logger.info(f"[BlockUpdate] Layer {layer_idx}: pre-update evaluation")
+        evaluate_block_loss_modes(
+            qlayer=qlayer,
+            args=args,
+            loss_func=loss_func,
+            quant_inputs=quant_inps,
+            fp_targets=fp_block_targets,
+            fp_targets_aug=fp_block_targets_aug,
+            teacher_router_labels=teacher_router_labels,
+            teacher_forcing_topk=routing_top_k,
+            layer_kwargs=layer_kwargs,
+            attention_mask_batch=attention_mask_batch,
+            position_ids=position_ids,
+            traincast=traincast,
+            logger=logger,
+            layer_idx=layer_idx,
+            epoch_idx="pre_update",
+            smooth_is_llama=True,
+        )
+
+        qkvo_prefixes = (
+            "self_attn.q_proj.",
+            "self_attn.k_proj.",
+            "self_attn.v_proj.",
+            "self_attn.o_proj.",
+        )
+        update_attn_lwc_params, update_attn_lora_params = collect_stage_parameters(
+            qlayer,
+            qkvo_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        router_params, shared_gate_params = collect_router_and_shared_gate_parameters(qlayer)
+
+        selected_params = []
+        selected_ids = set()
+        for param in update_attn_lwc_params + update_attn_lora_params + router_params + shared_gate_params:
+            if id(param) in selected_ids:
+                continue
+            selected_params.append(param)
+            selected_ids.add(id(param))
+
+        if not selected_params:
+            logger.warning(f"[BlockUpdate] Layer {layer_idx}: no trainable parameters selected, skipping update stage")
+        else:
+            original_requires_grad = {
+                id(param): param.requires_grad
+                for param in qlayer.parameters()
+            }
+            for param in qlayer.parameters():
+                param.requires_grad = False
+            for param in selected_params:
+                param.requires_grad = True
+
+            update_param_groups = []
+            if update_attn_lwc_params:
+                update_param_groups.append({"params": update_attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            if update_attn_lora_params:
+                update_param_groups.append({"params": update_attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            if router_params:
+                update_param_groups.append({"params": router_params, "lr": args.gate_lora_lr, "weight_decay": args.wd})
+            if shared_gate_params:
+                update_param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
+
+            update_optimizer = torch.optim.AdamW(update_param_groups, weight_decay=0)
+            update_scaler = utils.NativeScalerWithGradNormCount()
+
+            final_stage_loss = update_block_parameters_with_loss(
+                qlayer=qlayer,
+                args=args,
+                optimizer=update_optimizer,
+                loss_scaler=update_scaler,
+                clip_parameters=selected_params,
+                loss_func=loss_func,
+                quant_inputs=quant_inps,
+                fp_targets=fp_block_targets,
+                fp_targets_aug=fp_block_targets_aug,
+                teacher_router_labels=teacher_router_labels,
+                aux_enabled=block_aux_enabled,
+                aux_weight=block_aux_weight,
+                aux_topk=teacher_label_topk,
+                layer_kwargs=layer_kwargs,
+                attention_mask_batch=attention_mask_batch,
+                position_ids=position_ids,
+                traincast=traincast,
+                logger=logger,
+                layer_idx=layer_idx,
+                smooth_is_llama=True,
+                update_epochs=update_stage_epochs,
+            )
+
+            del update_optimizer
+            for param in qlayer.parameters():
+                param.requires_grad = original_requires_grad[id(param)]
+
+        logger.info(f"[BlockUpdate] Layer {layer_idx}: post-update evaluation")
+        evaluate_block_loss_modes(
+            qlayer=qlayer,
+            args=args,
+            loss_func=loss_func,
+            quant_inputs=quant_inps,
+            fp_targets=fp_block_targets,
+            fp_targets_aug=fp_block_targets_aug,
+            teacher_router_labels=teacher_router_labels,
+            teacher_forcing_topk=routing_top_k,
+            layer_kwargs=layer_kwargs,
+            attention_mask_batch=attention_mask_batch,
+            position_ids=position_ids,
+            traincast=traincast,
+            logger=logger,
+            layer_idx=layer_idx,
+            epoch_idx="post_update",
+            smooth_is_llama=True,
+        )
 
     del label_cache
     return final_stage_loss
