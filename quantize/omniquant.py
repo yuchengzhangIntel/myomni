@@ -878,7 +878,14 @@ def omniquant(
             and get_moe_experts_module(layer.mlp) is not None
         )
         layer_attn_epochs = get_attention_epochs(args, i)
-        train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and layer_attn_epochs > 0)
+        base_train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and layer_attn_epochs > 0)
+        max_train_layers = getattr(args, "max_train_layers", -1)
+        within_train_limit = max_train_layers < 0 or i < max_train_layers
+        train_current_layer = base_train_current_layer and within_train_limit
+        if base_train_current_layer and not within_train_limit:
+            logger.info(
+                f"[FastCheck] Layer {i}: skip training because max_train_layers={max_train_layers}"
+            )
 
         # =================================================================
         # Legacy Expert Shift Tracking for Router Calibration
@@ -1117,7 +1124,7 @@ def omniquant(
         
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
-        if args.epochs > 0 and not use_decoupled_moe_training:
+        if train_current_layer and not use_decoupled_moe_training:
             with torch.no_grad():
                 with torch.amp.autocast('cuda'):
                     for j in range(args.nsamples):

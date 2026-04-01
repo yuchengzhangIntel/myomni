@@ -465,6 +465,8 @@ def main():
                         help="Enable router auxiliary loss to keep quant router close to FP16 routing")
     parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
                         help="Weight for router auxiliary loss in block-wise update stage")
+    parser.add_argument("--max_train_layers", type=int, default=-1,
+                        help="Train at most the first N layers; use -1 for all layers, 1 for first block only")
 
     args = parser.parse_args()
     if args.attn_epochs is None:
@@ -477,6 +479,8 @@ def main():
         raise ValueError("--block_update_epochs must be non-negative")
     if args.block_aux_loss_weight < 0:
         raise ValueError("--block_aux_loss_weight must be non-negative")
+    if args.max_train_layers < -1:
+        raise ValueError("--max_train_layers must be -1 or a non-negative integer")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -554,6 +558,7 @@ def main():
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
 
     if args.enable_wandb:
@@ -722,6 +727,7 @@ def main():
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results
     wiki2_ppl = results.get('wikitext2', 'N/A')
