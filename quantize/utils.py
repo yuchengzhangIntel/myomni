@@ -8,8 +8,29 @@ from quantize.int_matmul import QuantMatMul
 from models.transformation import *
 
 
+def cuda_device_supports_native_bf16(device_idx=None):
+    if not torch.cuda.is_available():
+        return False
+
+    if device_idx is None:
+        device_idx = torch.cuda.current_device()
+
+    major, _minor = torch.cuda.get_device_capability(device_idx)
+    if major < 8:
+        return False
+
+    current_device = torch.cuda.current_device()
+    try:
+        with torch.cuda.device(device_idx):
+            if hasattr(torch.cuda, "is_bf16_supported"):
+                return torch.cuda.is_bf16_supported()
+            return True
+    finally:
+        torch.cuda.set_device(current_device)
+
+
 def get_cuda_amp_dtype():
-    if torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+    if cuda_device_supports_native_bf16():
         return torch.bfloat16
     return torch.float16
 

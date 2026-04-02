@@ -12,14 +12,17 @@ import pdb
 def all_cuda_devices_support_bf16():
     if not torch.cuda.is_available():
         return False
-    if not hasattr(torch.cuda, "is_bf16_supported"):
-        return False
 
     current_device = torch.cuda.current_device()
     supports_bf16 = True
     for device_idx in range(torch.cuda.device_count()):
+        major, _minor = torch.cuda.get_device_capability(device_idx)
+        # Native CUDA BF16 requires Ampere-or-newer GPUs (sm80+).
+        if major < 8:
+            supports_bf16 = False
+            break
         with torch.cuda.device(device_idx):
-            if not torch.cuda.is_bf16_supported():
+            if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
                 supports_bf16 = False
                 break
     torch.cuda.set_device(current_device)
