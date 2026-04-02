@@ -393,6 +393,8 @@ def main():
     parser.add_argument("--let_lr", type=float, default=5e-3)
     parser.add_argument("--lwc_lr", type=float, default=1e-2)
     parser.add_argument("--wd", type=float, default=0)
+    parser.add_argument("--max_grad_norm", type=float, default=None,
+                        help="Enable gradient clipping with the provided max norm; disabled when omitted")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--attn_epochs", type=int, default=None,
                         help="Base epoch count for decoupled attention training; defaults to --epochs and increases by 1 every 2 layers")
@@ -487,6 +489,8 @@ def main():
         raise ValueError("--epochs must be non-negative")
     if args.attn_epochs < 0:
         raise ValueError("--attn_epochs must be non-negative")
+    if args.max_grad_norm is not None and args.max_grad_norm <= 0:
+        raise ValueError("--max_grad_norm must be positive when provided")
     if args.block_update_epochs < 0:
         raise ValueError("--block_update_epochs must be non-negative")
     if args.block_aux_loss_weight < 0:

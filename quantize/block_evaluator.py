@@ -305,7 +305,7 @@ def update_block_parameters_with_loss(
     layer_idx,
     smooth_is_llama,
     update_epochs,
-    clip_grad=1.0,
+    clip_grad=None,
 ):
     """
     Update selected parameters with block-wise loss.
@@ -364,7 +364,7 @@ def update_block_parameters_with_loss(
             finally:
                 clear_temp_variable(qlayer)
 
-            if float(norm.item()) > float(clip_grad):
+            if clip_grad is not None and float(norm.item()) > float(clip_grad):
                 logger.info(
                     f"[GradClip] BlockUpdate layer {layer_idx} epoch {update_epoch} "
                     f"batch {start // args.batch_size}: grad_norm={_fmt_metric(norm.item())} > max_norm={_fmt_metric(clip_grad)}"

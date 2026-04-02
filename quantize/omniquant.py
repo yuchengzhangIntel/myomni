@@ -339,7 +339,7 @@ def train_decoupled_moe_layer(
     qlayer.float()
     final_stage_loss = None
     loss_func = torch.nn.MSELoss()
-    clip_grad_max_norm = 1.0
+    clip_grad_max_norm = getattr(args, "max_grad_norm", None)
     attn_epochs = get_attention_epochs(args, layer_idx)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
@@ -396,7 +396,7 @@ def train_decoupled_moe_layer(
                 if norm is None:
                     norm = torch.tensor(0.0, device=quant_inps.device)
                 norm = norm.cpu()
-                if float(norm.item()) > clip_grad_max_norm:
+                if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
                     logger.info(
                         f"[GradClip] Decoupled Attention layer {layer_idx} epoch {epoch} "
                         f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
@@ -522,7 +522,7 @@ def train_decoupled_moe_layer(
                 if norm is None:
                     norm = torch.tensor(0.0, device=quant_inps.device)
                 norm = norm.cpu()
-                if float(norm.item()) > clip_grad_max_norm:
+                if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
                     logger.info(
                         f"[GradClip] Decoupled MoE layer {layer_idx} epoch {epoch} "
                         f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
@@ -1139,12 +1139,13 @@ def omniquant(
                                         loss.backward()
                                         
                                         # Clip gradients to prevent explosion
-                                        grad_norm = torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
-                                        if float(grad_norm.item()) > 1.0:
-                                            logger.info(
-                                                f"[GradClip] Router Calibration layer {i} epoch {epoch} sample {j}: "
-                                                f"grad_norm={float(grad_norm.item()):.6g} > max_norm=1"
-                                            )
+                                        if getattr(args, "max_grad_norm", None) is not None:
+                                            grad_norm = torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=args.max_grad_norm)
+                                            if float(grad_norm.item()) > args.max_grad_norm:
+                                                logger.info(
+                                                    f"[GradClip] Router Calibration layer {i} epoch {epoch} sample {j}: "
+                                                    f"grad_norm={float(grad_norm.item()):.6g} > max_norm={args.max_grad_norm:.6g}"
+                                                )
                                         
                                         # Check for NaN gradients before stepping
                                         has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
@@ -1290,7 +1291,7 @@ def omniquant(
                 # Default weight_decay=0 for optimizer (each group specifies its own)
                 optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
                 loss_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-                clip_grad_max_norm = 1.0
+                clip_grad_max_norm = getattr(args, "max_grad_norm", None)
                 
                 # Collect all trainable parameters for gradient clipping
                 # Start with quantization parameters (LET/LWC)
@@ -1323,6 +1324,10 @@ def omniquant(
                         logger.info(f"[Linear LoRA] QuantLinear LoRA ENABLED with r={args.linear_lora_r}, alpha={args.linear_lora_alpha}, lr={args.linear_lora_lr}")
                     if not train_shared_gate and not train_gate_lora and not getattr(args, 'use_linear_lora', False):
                         logger.info("[Gate Training] All gate training DISABLED (default behavior)")
+                    if clip_grad_max_norm is None:
+                        logger.info("[GradClip] Disabled")
+                    else:
+                        logger.info(f"[GradClip] Enabled with max_norm={clip_grad_max_norm:.6g}")
                 
                 for epochs in range(args.epochs):
                     loss_list = []
@@ -1358,7 +1363,7 @@ def omniquant(
                         if norm is None:
                             norm = torch.tensor(0.0, device=quant_out.device)
                         norm = norm.cpu()
-                        if float(norm.item()) > clip_grad_max_norm:
+                        if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
                             logger.info(
                                 f"[GradClip] layer {i} iter {epochs} batch {j}: "
                                 f"grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
