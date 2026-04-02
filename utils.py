@@ -34,10 +34,26 @@ class NativeScalerWithGradNormCount:
         self._scaler = torch.amp.GradScaler('cuda') if self._use_grad_scaler else None
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True,retain_graph=False):
+        if self._use_grad_scaler:
+            # Keep FP16 behavior identical to the original implementation.
+            self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
+            if update_grad:
+                if clip_grad is not None:
+                    assert parameters is not None
+                    self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                    norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+                else:
+                    self._scaler.unscale_(optimizer)
+                    norm = ampscaler_get_grad_norm(parameters)
+                self._scaler.step(optimizer)
+                self._scaler.update()
+            else:
+                norm = None
+            return norm
+
+        # BF16 / no-GradScaler path: keep clipping and skip bad updates.
         if not torch.isfinite(loss.detach()):
             optimizer.zero_grad(set_to_none=True)
-            if self._use_grad_scaler:
-                self._scaler.update()
             return torch.tensor(0.0, device=loss.device)
 
         if isinstance(parameters, torch.Tensor):
@@ -47,20 +63,13 @@ class NativeScalerWithGradNormCount:
         else:
             param_list = list(parameters)
 
-        if self._use_grad_scaler:
-            self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
-        else:
-            loss.backward(create_graph=create_graph, retain_graph=retain_graph)
+        loss.backward(create_graph=create_graph, retain_graph=retain_graph)
 
         if update_grad:
             if clip_grad is not None:
                 assert param_list
-                if self._use_grad_scaler:
-                    self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 norm = torch.nn.utils.clip_grad_norm_(param_list, clip_grad)
             else:
-                if self._use_grad_scaler:
-                    self._scaler.unscale_(optimizer)
                 norm = ampscaler_get_grad_norm(param_list)
 
             if norm is None:
@@ -75,15 +84,9 @@ class NativeScalerWithGradNormCount:
 
             if is_nonfinite or is_too_large:
                 optimizer.zero_grad(set_to_none=True)
-                if self._use_grad_scaler:
-                    self._scaler.update()
                 return torch.tensor(0.0, device=loss.device)
 
-            if self._use_grad_scaler:
-                self._scaler.step(optimizer)
-                self._scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
         else:
             norm = None
         return norm
