@@ -19,6 +19,11 @@ def _iter_batch_indices(total: int, batch_size: int):
         yield start, end
 
 
+def _fmt_metric(value: float) -> str:
+    # Keep compact output and automatically switch to scientific notation for tiny values.
+    return f"{float(value):.6g}"
+
+
 def compute_fp_block_targets(
     layer,
     qlayer,
@@ -272,7 +277,7 @@ def evaluate_block_loss_modes(
 
         logger.info(
             f"[BlockEval] layer {layer_idx} epoch {epoch_idx} mode={mode} "
-            f"main_loss:{main_mean:.6f} aug_loss:{aug_mean:.6f} total_loss:{total_mean:.6f}"
+            f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} total_loss:{_fmt_metric(total_mean)}"
         )
 
     return results
@@ -300,6 +305,7 @@ def update_block_parameters_with_loss(
     layer_idx,
     smooth_is_llama,
     update_epochs,
+    clip_grad=1.0,
 ):
     """
     Update selected parameters with block-wise loss.
@@ -346,9 +352,23 @@ def update_block_parameters_with_loss(
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
 
-                norm = loss_scaler(total_loss, optimizer, parameters=clip_parameters).cpu()
+                norm = loss_scaler(
+                    total_loss,
+                    optimizer,
+                    clip_grad=clip_grad,
+                    parameters=clip_parameters,
+                )
+                if norm is None:
+                    norm = torch.tensor(0.0, device=quant_inputs.device)
+                norm = norm.cpu()
             finally:
                 clear_temp_variable(qlayer)
+
+            if float(norm.item()) > float(clip_grad):
+                logger.info(
+                    f"[GradClip] BlockUpdate layer {layer_idx} epoch {update_epoch} "
+                    f"batch {start // args.batch_size}: grad_norm={_fmt_metric(norm.item())} > max_norm={_fmt_metric(clip_grad)}"
+                )
 
             total_items.append(total_loss.detach().cpu())
             main_items.append(main_loss.detach().cpu())
@@ -365,8 +385,8 @@ def update_block_parameters_with_loss(
 
         logger.info(
             f"[BlockUpdate] layer {layer_idx} epoch {update_epoch} "
-            f"main_loss:{main_mean:.6f} aug_loss:{aug_mean:.6f} "
-            f"aux_loss:{aux_mean:.6f} total_loss:{total_mean:.6f} norm:{norm_mean:.6f}"
+            f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} "
+            f"aux_loss:{_fmt_metric(aux_mean)} total_loss:{_fmt_metric(total_mean)} norm:{_fmt_metric(norm_mean)}"
         )
 
     return final_total

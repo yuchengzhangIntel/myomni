@@ -8,6 +8,12 @@ from quantize.int_matmul import QuantMatMul
 from models.transformation import *
 
 
+def get_cuda_amp_dtype():
+    if torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 def get_layer_forward_kwargs(layer, layer_kwargs=None, **extra_kwargs):
     merged_kwargs = {}
     if layer_kwargs:
@@ -49,7 +55,7 @@ def extract_hidden_states(outputs):
 @torch.no_grad()
 def capture_router_labels_layerwise(layer, inps, dev, topk=20, logger=None, layer_kwargs=None):
     """
-    Capture FP16 router labels for a single layer using pre-captured inputs.
+    Capture mixed-precision router labels for a single layer using pre-captured inputs.
     This is more memory-efficient than processing the entire model at once.
     
     Args:
@@ -86,7 +92,7 @@ def capture_router_labels_layerwise(layer, inps, dev, topk=20, logger=None, laye
     
     for j in range(nsamples):
         captured_data.clear()
-        with torch.amp.autocast('cuda'):
+        with torch.autocast(device_type='cuda', dtype=get_cuda_amp_dtype()):
             _ = call_layer_forward(layer, inps[j].unsqueeze(0), layer_kwargs=layer_kwargs)
         if captured_data:
             values, indices = captured_data[0]

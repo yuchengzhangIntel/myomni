@@ -9,6 +9,23 @@ from tqdm import tqdm
 import pdb
 
 
+def all_cuda_devices_support_bf16():
+    if not torch.cuda.is_available():
+        return False
+    if not hasattr(torch.cuda, "is_bf16_supported"):
+        return False
+
+    current_device = torch.cuda.current_device()
+    supports_bf16 = True
+    for device_idx in range(torch.cuda.device_count()):
+        with torch.cuda.device(device_idx):
+            if not torch.cuda.is_bf16_supported():
+                supports_bf16 = False
+                break
+    torch.cuda.set_device(current_device)
+    return supports_bf16
+
+
 class LMClass(BaseLM):
     def __init__(self, args):
 
@@ -26,11 +43,22 @@ class LMClass(BaseLM):
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False, legacy=False, trust_remote_code=True)
         # self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=config.torch_dtype)
-        self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu', torch_dtype=torch.float16, trust_remote_code=True)
+        if torch.cuda.is_available():
+            model_dtype = torch.bfloat16 if all_cuda_devices_support_bf16() else torch.float16
+        else:
+            model_dtype = torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            config=config,
+            device_map='cpu',
+            torch_dtype=model_dtype,
+            trust_remote_code=True,
+        )
         self.seqlen = self.model.config.max_position_embeddings
         self.model.eval()
         self.vocab_size = self.tokenizer.vocab_size
         print("vocab size: ", self.vocab_size)
+        print("model dtype: ", model_dtype)
 
     @property
     def eot_token(self) -> str:

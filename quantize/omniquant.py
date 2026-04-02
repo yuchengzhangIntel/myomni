@@ -94,6 +94,23 @@ except:
     print("auto_gptq is required for real quantization")
 
 
+def all_cuda_devices_support_bf16():
+    if not torch.cuda.is_available():
+        return False
+    if not hasattr(torch.cuda, "is_bf16_supported"):
+        return False
+
+    current_device = torch.cuda.current_device()
+    supports_bf16 = True
+    for device_idx in range(torch.cuda.device_count()):
+        with torch.cuda.device(device_idx):
+            if not torch.cuda.is_bf16_supported():
+                supports_bf16 = False
+                break
+    torch.cuda.set_device(current_device)
+    return supports_bf16
+
+
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, QuantLinear)}
@@ -306,6 +323,7 @@ def train_decoupled_moe_layer(
     attention_mask,
     position_ids,
     traincast,
+    use_grad_scaler,
     quant_routing_top_n,
     use_router_weight_in_loss,
 ):
@@ -321,6 +339,7 @@ def train_decoupled_moe_layer(
     qlayer.float()
     final_stage_loss = None
     loss_func = torch.nn.MSELoss()
+    clip_grad_max_norm = 1.0
     attn_epochs = get_attention_epochs(args, layer_idx)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
@@ -339,7 +358,7 @@ def train_decoupled_moe_layer(
     if attn_param_groups and attn_epochs > 0:
         logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {attn_epochs} epochs")
         attn_optimizer = torch.optim.AdamW(attn_param_groups, weight_decay=0)
-        attn_scaler = utils.NativeScalerWithGradNormCount()
+        attn_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
         attn_clip_params = attn_lwc_params + attn_lora_params
         for epoch in range(attn_epochs):
             loss_list = []
@@ -349,7 +368,7 @@ def train_decoupled_moe_layer(
                 batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
                 attn_optimizer.zero_grad()
                 with torch.no_grad():
-                    with torch.amp.autocast('cuda'):
+                    with traincast():
                         teacher_attn_outputs = compute_attention_outputs(
                             layer,
                             fp_inps[start:end],
@@ -368,7 +387,20 @@ def train_decoupled_moe_layer(
                     )
                     loss = loss_func(student_attn_outputs, teacher_attn_outputs)
                 loss_list.append(loss.detach().cpu())
-                norm = attn_scaler(loss, attn_optimizer, parameters=attn_clip_params).cpu()
+                norm = attn_scaler(
+                    loss,
+                    attn_optimizer,
+                    clip_grad=clip_grad_max_norm,
+                    parameters=attn_clip_params,
+                )
+                if norm is None:
+                    norm = torch.tensor(0.0, device=quant_inps.device)
+                norm = norm.cpu()
+                if float(norm.item()) > clip_grad_max_norm:
+                    logger.info(
+                        f"[GradClip] Decoupled Attention layer {layer_idx} epoch {epoch} "
+                        f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
+                    )
                 norm_list.append(norm)
                 clear_temp_variable(qlayer)
 
@@ -448,7 +480,7 @@ def train_decoupled_moe_layer(
     if moe_param_groups and args.epochs > 0:
         logger.info(f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs")
         moe_optimizer = torch.optim.AdamW(moe_param_groups, weight_decay=0)
-        moe_scaler = utils.NativeScalerWithGradNormCount()
+        moe_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
         moe_clip_params = moe_lwc_params + moe_lora_params
         for epoch in range(args.epochs):
             loss_list = []
@@ -481,7 +513,20 @@ def train_decoupled_moe_layer(
                         precomputed_mlp_inputs=detached_mlp_inputs,
                     )
                 loss_list.append(loss.detach().cpu())
-                norm = moe_scaler(loss, moe_optimizer, parameters=moe_clip_params).cpu()
+                norm = moe_scaler(
+                    loss,
+                    moe_optimizer,
+                    clip_grad=clip_grad_max_norm,
+                    parameters=moe_clip_params,
+                )
+                if norm is None:
+                    norm = torch.tensor(0.0, device=quant_inps.device)
+                norm = norm.cpu()
+                if float(norm.item()) > clip_grad_max_norm:
+                    logger.info(
+                        f"[GradClip] Decoupled MoE layer {layer_idx} epoch {epoch} "
+                        f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
+                    )
                 norm_list.append(norm)
                 clear_temp_variable(qlayer)
 
@@ -576,7 +621,7 @@ def train_decoupled_moe_layer(
                 update_param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
 
             update_optimizer = torch.optim.AdamW(update_param_groups, weight_decay=0)
-            update_scaler = utils.NativeScalerWithGradNormCount()
+            update_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
 
             final_stage_loss = update_block_parameters_with_loss(
                 qlayer=qlayer,
@@ -600,6 +645,7 @@ def train_decoupled_moe_layer(
                 layer_idx=layer_idx,
                 smooth_is_llama=True,
                 update_epochs=update_stage_epochs,
+                clip_grad=clip_grad_max_norm,
             )
 
             del update_optimizer
@@ -728,12 +774,23 @@ def omniquant(
     layers[0] = layers[0].to(dev)
     attn_epochs = get_attention_epochs(args)
     has_any_training_epochs = args.epochs > 0 or attn_epochs > 0
-    if args.deactive_amp and has_any_training_epochs:
+    amp_enabled = not (args.deactive_amp and has_any_training_epochs)
+    if amp_enabled:
+        amp_dtype = torch.bfloat16 if all_cuda_devices_support_bf16() else torch.float16
+        dtype = amp_dtype
+        traincast = lambda: torch.autocast(device_type='cuda', dtype=amp_dtype)
+        use_grad_scaler = amp_dtype == torch.float16
+        if logger is not None:
+            amp_label = "BF16" if amp_dtype == torch.bfloat16 else "FP16"
+            logger.info(f"[AMP] Enabled CUDA autocast with {amp_label}")
+            logger.info(f"[AMP] GradScaler {'enabled' if use_grad_scaler else 'disabled'}")
+    else:
         dtype = torch.float
         traincast = nullcontext
-    else:
-        dtype = torch.float16
-        traincast = lambda: torch.amp.autocast('cuda')
+        use_grad_scaler = False
+        if logger is not None:
+            logger.info("[AMP] Disabled (deactive_amp=True)")
+            logger.info("[AMP] GradScaler disabled")
     inps = torch.zeros(
         (args.nsamples, lm.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
@@ -945,7 +1002,7 @@ def omniquant(
                     for j in range(min(num_samples, inputs.shape[0])):
                         # Use hook-based forward to get router logits
                         # Use autocast to handle dtype mismatch (input FP16, weights FP32)
-                        with torch.amp.autocast('cuda'):
+                        with traincast():
                             out, router_logits = forward_with_router_logits(
                                 layer,
                                 inputs[j].unsqueeze(0),
@@ -1048,7 +1105,7 @@ def omniquant(
                                 
                                 # Forward pass - qlayer is FP32, use autocast for efficiency
                                 # Must call smooth_and_quant_temporary each iteration to recreate computation graph
-                                with torch.amp.autocast('cuda'):
+                                with traincast():
                                     smooth_and_quant_temporary(qlayer, args, is_llama)
                                     _ = call_layer_forward(
                                         qlayer,
@@ -1082,7 +1139,12 @@ def omniquant(
                                         loss.backward()
                                         
                                         # Clip gradients to prevent explosion
-                                        torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
+                                        grad_norm = torch.nn.utils.clip_grad_norm_(router_gate_params, max_norm=1.0)
+                                        if float(grad_norm.item()) > 1.0:
+                                            logger.info(
+                                                f"[GradClip] Router Calibration layer {i} epoch {epoch} sample {j}: "
+                                                f"grad_norm={float(grad_norm.item()):.6g} > max_norm=1"
+                                            )
                                         
                                         # Check for NaN gradients before stepping
                                         has_nan_grad = any(p.grad is not None and torch.isnan(p.grad).any() for p in router_gate_params)
@@ -1126,7 +1188,7 @@ def omniquant(
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
         if train_current_layer and not use_decoupled_moe_training:
             with torch.no_grad():
-                with torch.amp.autocast('cuda'):
+                with traincast():
                     for j in range(args.nsamples):
                         fp_inps[j] = extract_hidden_states(call_layer_forward(
                             qlayer,
@@ -1185,6 +1247,7 @@ def omniquant(
                     attention_mask,
                     position_ids,
                     traincast,
+                    use_grad_scaler,
                     quant_routing_top_n,
                     use_router_weight_in_loss,
                 )
@@ -1226,7 +1289,8 @@ def omniquant(
                 
                 # Default weight_decay=0 for optimizer (each group specifies its own)
                 optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
-                loss_scaler = utils.NativeScalerWithGradNormCount()
+                loss_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
+                clip_grad_max_norm = 1.0
                 
                 # Collect all trainable parameters for gradient clipping
                 # Start with quantization parameters (LET/LWC)
@@ -1285,7 +1349,20 @@ def omniquant(
                         loss_list.append(loss.detach().cpu())
                         optimizer.zero_grad()
                         # Use complete parameter list for gradient clipping
-                        norm = loss_scaler(loss, optimizer, parameters=clip_parameters).cpu()
+                        norm = loss_scaler(
+                            loss,
+                            optimizer,
+                            clip_grad=clip_grad_max_norm,
+                            parameters=clip_parameters,
+                        )
+                        if norm is None:
+                            norm = torch.tensor(0.0, device=quant_out.device)
+                        norm = norm.cpu()
+                        if float(norm.item()) > clip_grad_max_norm:
+                            logger.info(
+                                f"[GradClip] layer {i} iter {epochs} batch {j}: "
+                                f"grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
+                            )
                         norm_list.append(norm.data)
 
                     loss_mean = torch.stack(loss_list).mean()
@@ -1407,7 +1484,7 @@ def omniquant(
         if train_current_layer and use_decoupled_moe_training:
             set_quant_state(qlayer, weight_quant=False, act_quant=False)
             with torch.no_grad():
-                with torch.amp.autocast('cuda'):
+                with traincast():
                     for j in range(args.nsamples):
                         fp_inps[j] = extract_hidden_states(call_layer_forward(
                             layer,
@@ -1442,7 +1519,7 @@ def omniquant(
                 num_samples = min(args.nsamples, 8)
                 for j in range(num_samples):
                     # Use hook-based forward to get router logits
-                    with torch.amp.autocast('cuda'):
+                    with traincast():
                         out, router_logits = forward_with_router_logits(
                             qlayer,
                             quant_inps[j].unsqueeze(0),
