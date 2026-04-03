@@ -366,3 +366,68 @@ def test_moe_self_supervision_loss_reduces_per_expert_before_aggregation():
     )
 
     assert torch.allclose(loss, torch.tensor(5.0), atol=1e-7)
+
+
+def test_moe_self_supervision_loss_aggregates_same_expert_tokens_across_batch():
+    class ZeroAttention(nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return (torch.zeros_like(hidden_states), None)
+
+    class IdentityNorm(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class IdentityExpert(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = IdentityNorm()
+            self.post_attention_layernorm = IdentityNorm()
+            self.self_attn = ZeroAttention()
+            self.mlp = nn.Module()
+            self.mlp.experts = nn.ModuleList([IdentityExpert()])
+
+    qlayer = FakeLayer()
+    mlp_inputs = torch.tensor([
+        [[1.0], [0.0]],
+        [[3.0], [3.0]],
+    ])
+
+    batch_label_cache = [
+        {
+            "expert_labels": {
+                0: {
+                    "token_idx": pin_cpu_tensor(torch.tensor([0], dtype=torch.long)),
+                    "weights": pin_cpu_tensor(torch.tensor([1.0], dtype=torch.float32)),
+                    "labels": pin_cpu_tensor(torch.tensor([[0.0]], dtype=torch.float32)),
+                },
+            },
+            "shared_labels": None,
+        },
+        {
+            "expert_labels": {
+                0: {
+                    "token_idx": pin_cpu_tensor(torch.tensor([0, 1], dtype=torch.long)),
+                    "weights": pin_cpu_tensor(torch.tensor([1.0, 1.0], dtype=torch.float32)),
+                    "labels": pin_cpu_tensor(torch.tensor([[0.0], [0.0]], dtype=torch.float32)),
+                },
+            },
+            "shared_labels": None,
+        },
+    ]
+
+    loss = compute_moe_self_supervision_loss(
+        qlayer,
+        quant_inputs=None,
+        batch_label_cache=batch_label_cache,
+        layer_kwargs={},
+        attention_mask=None,
+        position_ids=None,
+        use_router_weight_in_loss=False,
+        precomputed_mlp_inputs=mlp_inputs,
+    )
+
+    assert torch.allclose(loss, torch.tensor(19.0 / 3.0), atol=1e-7)

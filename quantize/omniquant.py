@@ -282,6 +282,7 @@ def compute_moe_self_supervision_loss(
         mlp_inputs = precomputed_mlp_inputs
     experts_module = get_moe_experts_module(qlayer.mlp)
     shared_expert = get_shared_expert_module(qlayer.mlp)
+    expert_loss_terms = {}
     loss_terms = []
 
     for batch_idx, sample_cache in enumerate(batch_label_cache):
@@ -298,13 +299,16 @@ def compute_moe_self_supervision_loss(
             if use_router_weight_in_loss:
                 weights = cached_values["weights"].to(sample_inputs.device, non_blocking=True).float()
                 expert_loss = expert_loss * weights
-            loss_terms.append(expert_loss.mean())
+            expert_loss_terms.setdefault(expert_idx, []).append(expert_loss)
 
         if sample_cache["shared_labels"] is not None and shared_expert is not None:
             shared_labels = sample_cache["shared_labels"].to(sample_inputs.device, non_blocking=True)
             student_shared = extract_hidden_states(call_layer_forward(shared_expert, sample_inputs))
             shared_loss = (student_shared.float() - shared_labels.float()).pow(2).mean(dim=-1)
             loss_terms.append(shared_loss.mean())
+
+    for expert_terms in expert_loss_terms.values():
+        loss_terms.append(torch.cat(expert_terms).mean())
 
     if not loss_terms:
         loss_device = mlp_inputs.device if precomputed_mlp_inputs is not None else quant_inputs.device
