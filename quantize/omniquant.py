@@ -169,6 +169,49 @@ def collect_router_and_shared_gate_parameters(module):
     return router_params, shared_gate_params
 
 
+def dedupe_parameters(parameters):
+    unique_params = []
+    seen = set()
+
+    for param in parameters:
+        if id(param) in seen:
+            continue
+        unique_params.append(param)
+        seen.add(id(param))
+
+    return unique_params
+
+
+def build_block_update_param_groups(module, args):
+    attention_prefixes = ("self_attn.",)
+    selected_params = []
+    param_groups = []
+
+    if getattr(args, "block_update_attn", False):
+        attn_lwc_params, attn_lora_params = collect_stage_parameters(
+            module,
+            attention_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if attn_lwc_params:
+            param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(attn_lwc_params)
+        if attn_lora_params:
+            param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(attn_lora_params)
+
+    if getattr(args, "block_update_router", False):
+        router_params, shared_gate_params = collect_router_and_shared_gate_parameters(module)
+        if router_params:
+            param_groups.append({"params": router_params, "lr": args.gate_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(router_params)
+        if shared_gate_params:
+            param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
+            selected_params.extend(shared_gate_params)
+
+    return dedupe_parameters(selected_params), param_groups
+
+
 def compute_attention_outputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
     normed_hidden_states = layer.input_layernorm(hidden_states)
     return extract_hidden_states(call_layer_forward(
@@ -450,7 +493,7 @@ def train_decoupled_moe_layer(
     )
     if teacher_router_labels is None:
         logger.warning(
-            f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, teacher-forcing and aux-router loss will be skipped"
+            f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, auxiliary router loss will be skipped"
         )
 
     eval_interval = getattr(args, "block_eval_interval", 0)
@@ -478,17 +521,26 @@ def train_decoupled_moe_layer(
         moe_prefixes,
         include_linear_lora=getattr(args, "use_linear_lora", False),
     )
+    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
     moe_param_groups = []
+    if attn_lwc_params:
+        moe_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+    if attn_lora_params:
+        moe_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
     if moe_lwc_params:
         moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
     if moe_lora_params:
         moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
 
     if moe_param_groups and args.epochs > 0:
-        logger.info(f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs")
+        joint_attn_enabled = bool(joint_moe_attn_params)
+        logger.info(
+            f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs"
+            + (" with joint attention updates" if joint_attn_enabled else "")
+        )
         moe_optimizer = torch.optim.AdamW(moe_param_groups, weight_decay=0)
         moe_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-        moe_clip_params = moe_lwc_params + moe_lora_params
+        moe_clip_params = dedupe_parameters(attn_lwc_params + attn_lora_params + moe_lwc_params + moe_lora_params)
         for epoch in range(args.epochs):
             loss_list = []
             norm_list = []
@@ -498,27 +550,37 @@ def train_decoupled_moe_layer(
                 moe_optimizer.zero_grad()
                 with traincast():
                     smooth_and_quant_temporary(qlayer, args, isllama=True)
-                with torch.no_grad():
-                    with traincast():
-                        _, _, detached_mlp_inputs = compute_mlp_inputs(
+                with traincast():
+                    if joint_attn_enabled:
+                        loss = compute_moe_self_supervision_loss(
                             qlayer,
                             quant_inps[start:end],
+                            label_cache[start:end],
                             layer_kwargs,
-                            attention_mask=batch_attention_mask,
-                            position_ids=position_ids,
+                            batch_attention_mask,
+                            position_ids,
+                            use_router_weight_in_loss,
                         )
-                        detached_mlp_inputs = detached_mlp_inputs.detach()
-                with traincast():
-                    loss = compute_moe_self_supervision_loss(
-                        qlayer,
-                        quant_inps[start:end],
-                        label_cache[start:end],
-                        layer_kwargs,
-                        batch_attention_mask,
-                        position_ids,
-                        use_router_weight_in_loss,
-                        precomputed_mlp_inputs=detached_mlp_inputs,
-                    )
+                    else:
+                        with torch.no_grad():
+                            _, _, detached_mlp_inputs = compute_mlp_inputs(
+                                qlayer,
+                                quant_inps[start:end],
+                                layer_kwargs,
+                                attention_mask=batch_attention_mask,
+                                position_ids=position_ids,
+                            )
+                            detached_mlp_inputs = detached_mlp_inputs.detach()
+                        loss = compute_moe_self_supervision_loss(
+                            qlayer,
+                            quant_inps[start:end],
+                            label_cache[start:end],
+                            layer_kwargs,
+                            batch_attention_mask,
+                            position_ids,
+                            use_router_weight_in_loss,
+                            precomputed_mlp_inputs=detached_mlp_inputs,
+                        )
                 loss_list.append(loss.detach().cpu())
                 norm = moe_scaler(
                     loss,
@@ -550,8 +612,6 @@ def train_decoupled_moe_layer(
                     quant_inputs=quant_inps,
                     fp_targets=fp_block_targets,
                     fp_targets_aug=fp_block_targets_aug,
-                    teacher_router_labels=teacher_router_labels,
-                    teacher_forcing_topk=routing_top_k,
                     layer_kwargs=layer_kwargs,
                     attention_mask_batch=attention_mask_batch,
                     position_ids=position_ids,
@@ -572,8 +632,6 @@ def train_decoupled_moe_layer(
             quant_inputs=quant_inps,
             fp_targets=fp_block_targets,
             fp_targets_aug=fp_block_targets_aug,
-            teacher_router_labels=teacher_router_labels,
-            teacher_forcing_topk=routing_top_k,
             layer_kwargs=layer_kwargs,
             attention_mask_batch=attention_mask_batch,
             position_ids=position_ids,
@@ -584,26 +642,7 @@ def train_decoupled_moe_layer(
             smooth_is_llama=True,
         )
 
-        qkvo_prefixes = (
-            "self_attn.q_proj.",
-            "self_attn.k_proj.",
-            "self_attn.v_proj.",
-            "self_attn.o_proj.",
-        )
-        update_attn_lwc_params, update_attn_lora_params = collect_stage_parameters(
-            qlayer,
-            qkvo_prefixes,
-            include_linear_lora=getattr(args, "use_linear_lora", False),
-        )
-        router_params, shared_gate_params = collect_router_and_shared_gate_parameters(qlayer)
-
-        selected_params = []
-        selected_ids = set()
-        for param in update_attn_lwc_params + update_attn_lora_params + router_params + shared_gate_params:
-            if id(param) in selected_ids:
-                continue
-            selected_params.append(param)
-            selected_ids.add(id(param))
+        selected_params, update_param_groups = build_block_update_param_groups(qlayer, args)
 
         if not selected_params:
             logger.warning(f"[BlockUpdate] Layer {layer_idx}: no trainable parameters selected, skipping update stage")
@@ -616,16 +655,6 @@ def train_decoupled_moe_layer(
                 param.requires_grad = False
             for param in selected_params:
                 param.requires_grad = True
-
-            update_param_groups = []
-            if update_attn_lwc_params:
-                update_param_groups.append({"params": update_attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-            if update_attn_lora_params:
-                update_param_groups.append({"params": update_attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-            if router_params:
-                update_param_groups.append({"params": router_params, "lr": args.gate_lora_lr, "weight_decay": args.wd})
-            if shared_gate_params:
-                update_param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
 
             update_optimizer = torch.optim.AdamW(update_param_groups, weight_decay=0)
             update_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
@@ -667,8 +696,6 @@ def train_decoupled_moe_layer(
             quant_inputs=quant_inps,
             fp_targets=fp_block_targets,
             fp_targets_aug=fp_block_targets_aug,
-            teacher_router_labels=teacher_router_labels,
-            teacher_forcing_topk=routing_top_k,
             layer_kwargs=layer_kwargs,
             attention_mask_batch=attention_mask_batch,
             position_ids=position_ids,

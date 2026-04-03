@@ -470,11 +470,15 @@ def main():
     parser.add_argument("--use_router_weight_in_loss", default=False, action="store_true",
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
     parser.add_argument("--block_eval_interval", type=int, default=0,
-                        help="Run block-wise evaluation every N MoE epochs; disabled when < 1")
+                        help="Run student-only block-wise evaluation every N MoE epochs; disabled when < 1")
     parser.add_argument("--enable_block_loss_update", default=False, action="store_true",
-                        help="Enable post-MoE block-wise update stage (pre-eval -> update -> post-eval)")
+                        help="Enable post-MoE student-loss block-wise update stage (pre-eval -> update -> post-eval)")
     parser.add_argument("--block_update_epochs", type=int, default=1,
                         help="Epoch count for post-MoE block-wise update stage")
+    parser.add_argument("--block_update_attn", default=False, action="store_true",
+                        help="Allow student-loss block update stage to update attention LWC/LoRA parameters")
+    parser.add_argument("--block_update_router", default=False, action="store_true",
+                        help="Allow student-loss block update stage to update router/shared-gate parameters")
     parser.add_argument("--block_aux_loss", default=False, action="store_true",
                         help="Enable router auxiliary loss to keep quant router close to FP16 routing")
     parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
@@ -572,6 +576,8 @@ def main():
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
     logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
+    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
+    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
@@ -741,6 +747,8 @@ def main():
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
     logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
+    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
+    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")

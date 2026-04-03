@@ -92,71 +92,6 @@ def capture_teacher_router_labels(
     )
 
 
-def _build_forced_router_logits(
-    router_output: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    teacher_indices: torch.Tensor,
-) -> torch.Tensor:
-    if router_output.dim() not in (2, 3):
-        return router_output
-
-    forced_logits = torch.full_like(router_output, -10000.0)
-    if teacher_indices is None or teacher_indices.numel() == 0:
-        return forced_logits
-
-    if teacher_logits is None or teacher_logits.numel() == 0:
-        return forced_logits
-
-    if router_output.dim() == 2:
-        forced_indices = teacher_indices.reshape(-1, teacher_indices.shape[-1]).to(router_output.device)
-        forced_values = teacher_logits.reshape(-1, teacher_logits.shape[-1]).to(
-            device=router_output.device,
-            dtype=router_output.dtype,
-        )
-
-        token_count = min(router_output.shape[0], forced_indices.shape[0], forced_values.shape[0])
-        if token_count <= 0:
-            return forced_logits
-
-        k = min(forced_indices.shape[-1], forced_values.shape[-1], router_output.shape[-1])
-        if k <= 0:
-            return forced_logits
-
-        forced_values = forced_values[:token_count, :k]
-        forced_values = forced_values - forced_values.max(dim=-1, keepdim=True).values
-        forced_logits[:token_count].scatter_(-1, forced_indices[:token_count, :k], forced_values)
-        return forced_logits
-
-    forced_indices = teacher_indices.to(router_output.device)
-    forced_values = teacher_logits.to(device=router_output.device, dtype=router_output.dtype)
-
-    batch_size = min(router_output.shape[0], forced_indices.shape[0], forced_values.shape[0])
-    seq_len = min(router_output.shape[1], forced_indices.shape[1], forced_values.shape[1])
-    if batch_size <= 0 or seq_len <= 0:
-        return forced_logits
-
-    k = min(forced_indices.shape[-1], forced_values.shape[-1], router_output.shape[-1])
-    if k <= 0:
-        return forced_logits
-
-    forced_indices = forced_indices[:batch_size, :seq_len, :k]
-    forced_values = forced_values[:batch_size, :seq_len, :k]
-    forced_values = forced_values - forced_values.max(dim=-1, keepdim=True).values
-    forced_logits[:batch_size, :seq_len].scatter_(
-        -1,
-        forced_indices,
-        forced_values,
-    )
-    return forced_logits
-
-
-def _teacher_forcing_hook_factory(teacher_logits_batch: torch.Tensor, teacher_indices_batch: torch.Tensor):
-    def _hook(_module, _inputs, output):
-        return _build_forced_router_logits(output, teacher_logits_batch, teacher_indices_batch)
-
-    return _hook
-
-
 def _get_batch_attention_mask(attention_mask_batch, start: int, end: int):
     if attention_mask_batch is None:
         return None
@@ -203,8 +138,6 @@ def evaluate_block_loss_modes(
     quant_inputs,
     fp_targets,
     fp_targets_aug,
-    teacher_router_labels,
-    teacher_forcing_topk,
     layer_kwargs,
     attention_mask_batch,
     position_ids,
@@ -215,70 +148,56 @@ def evaluate_block_loss_modes(
     smooth_is_llama,
 ):
     """
-    Evaluate block-wise loss in two modes and return scalar logs.
+    Evaluate block-wise loss with student routing and return scalar logs.
     """
     results: Dict[str, Dict[str, float]] = {}
     set_quant_state(qlayer, weight_quant=False, act_quant=True)
 
-    eval_modes = ["student", "teacher_forcing"]
-    for mode in eval_modes:
-        if mode == "teacher_forcing" and teacher_router_labels is None:
-            continue
+    main_items = []
+    aug_items = []
+    total_items = []
 
-        main_items = []
-        aug_items = []
-        total_items = []
+    with torch.no_grad():
+        for start, end in _iter_batch_indices(args.nsamples, args.batch_size):
+            batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
 
-        with torch.no_grad():
-            for start, end in _iter_batch_indices(args.nsamples, args.batch_size):
-                batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
-                gate_hook = None
-                if mode == "teacher_forcing":
-                    teacher_logits = teacher_router_labels[0][start:end, :, :teacher_forcing_topk]
-                    teacher_indices = teacher_router_labels[1][start:end, :, :teacher_forcing_topk]
-                    gate_hook = qlayer.mlp.gate.register_forward_hook(
-                        _teacher_forcing_hook_factory(teacher_logits, teacher_indices)
-                    )
-
-                try:
-                    with traincast():
-                        smooth_and_quant_temporary(qlayer, args, smooth_is_llama)
-                        quant_out = extract_hidden_states(
-                            call_layer_forward(
-                                qlayer,
-                                quant_inputs[start:end],
-                                layer_kwargs=layer_kwargs,
-                                attention_mask=batch_attention_mask,
-                                position_ids=position_ids,
-                            )
+            try:
+                with traincast():
+                    smooth_and_quant_temporary(qlayer, args, smooth_is_llama)
+                    quant_out = extract_hidden_states(
+                        call_layer_forward(
+                            qlayer,
+                            quant_inputs[start:end],
+                            layer_kwargs=layer_kwargs,
+                            attention_mask=batch_attention_mask,
+                            position_ids=position_ids,
                         )
-                        main_loss = loss_func(fp_targets[start:end], quant_out)
-                        aug_loss = torch.zeros_like(main_loss)
-                        if fp_targets_aug is not None:
-                            aug_loss = loss_func(fp_targets_aug[start:end], quant_out)
-                        total_loss = main_loss + aug_loss
-                finally:
-                    if gate_hook is not None:
-                        gate_hook.remove()
-                    clear_temp_variable(qlayer)
+                    )
+                    main_loss = loss_func(fp_targets[start:end], quant_out)
+                    aug_loss = torch.zeros_like(main_loss)
+                    if fp_targets_aug is not None:
+                        aug_loss = loss_func(fp_targets_aug[start:end], quant_out)
+                    total_loss = main_loss + aug_loss
+            finally:
+                clear_temp_variable(qlayer)
 
-                main_items.append(main_loss.detach().cpu())
-                aug_items.append(aug_loss.detach().cpu())
-                total_items.append(total_loss.detach().cpu())
+            main_items.append(main_loss.detach().cpu())
+            aug_items.append(aug_loss.detach().cpu())
+            total_items.append(total_loss.detach().cpu())
 
-        main_mean = torch.stack(main_items).mean().item()
-        aug_mean = torch.stack(aug_items).mean().item() if aug_items else 0.0
-        total_mean = torch.stack(total_items).mean().item()
-        results[mode] = {
-            "main": main_mean,
-            "aug": aug_mean,
-            "total": total_mean,
-        }
+    main_mean = torch.stack(main_items).mean().item()
+    aug_mean = torch.stack(aug_items).mean().item() if aug_items else 0.0
+    total_mean = torch.stack(total_items).mean().item()
+    results["student"] = {
+        "main": main_mean,
+        "aug": aug_mean,
+        "total": total_mean,
+    }
 
-        logger.info(
-            f"[BlockEval] layer {layer_idx} epoch {epoch_idx} mode={mode} "
-            f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} total_loss:{_fmt_metric(total_mean)}"
-        )
+    logger.info(
+        f"[BlockEval] layer {layer_idx} epoch {epoch_idx} mode=student "
+        f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} total_loss:{_fmt_metric(total_mean)}"
+    )
 
     return results
 
