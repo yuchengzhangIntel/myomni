@@ -75,3 +75,20 @@ def test_smooth_and_quant_inplace_merges_lora_once():
     assert wrapper.linear.lora_A is None
     assert wrapper.linear.lora_B is None
     assert torch.allclose(actual_output, expected_output)
+
+
+def test_quantlinear_forward_aligns_input_dtype_with_weight():
+    linear = nn.Linear(4, 3, bias=True, dtype=torch.float64)
+    module = QuantLinear(linear, {"n_bits": 16}, {"n_bits": 16})
+
+    input_tensor = torch.randn(2, 4, dtype=torch.float32)
+    output = module(input_tensor)
+
+    expected = nn.functional.linear(
+        input_tensor.to(linear.weight.dtype),
+        linear.weight,
+        linear.bias,
+    )
+
+    assert output.dtype == linear.weight.dtype
+    assert torch.allclose(output, expected)

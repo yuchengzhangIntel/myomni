@@ -886,6 +886,8 @@ def omniquant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
+        layer_param = next(layer.parameters(), None)
+        layer_dtype = layer_param.dtype if layer_param is not None else torch.float16
         current_fp_layer_inputs = fp_inps
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():  
             # For MoE models (Mixtral, Qwen/DeepSeek MoE), only the LWC-style path is supported.
@@ -1589,7 +1591,7 @@ def omniquant(
             # Clean up temp_weight
             clear_temp_variable(qlayer)
         
-        qlayer.half() 
+        qlayer = qlayer.to(dtype=layer_dtype)
         # real smooth and quantization
         smooth_and_quant_inplace(qlayer, args, is_llama)
         if train_current_layer:

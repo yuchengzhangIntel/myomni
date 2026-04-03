@@ -126,7 +126,16 @@ class QuantLinear(nn.Module):
 
         weight_tensor = cast(torch.Tensor, weight)
         bias_tensor = cast(torch.Tensor | None, bias)
-        out = F.linear(input, weight_tensor, bias_tensor, **self.fwd_kwargs)
+
+        # Keep linear operands on the same dtype to avoid runtime matmul failures
+        # when upstream ops produce float32 activations on mixed-precision models.
+        input_tensor = input
+        if input_tensor.dtype != weight_tensor.dtype:
+            input_tensor = input_tensor.to(weight_tensor.dtype)
+        if bias_tensor is not None and bias_tensor.dtype != weight_tensor.dtype:
+            bias_tensor = bias_tensor.to(weight_tensor.dtype)
+
+        out = F.linear(input_tensor, weight_tensor, bias_tensor, **self.fwd_kwargs)
 
 
         return out
