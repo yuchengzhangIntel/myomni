@@ -241,6 +241,9 @@ def update_block_parameters_with_loss(
         aug_items = []
         aux_items = []
         norm_items = []
+        skipped_aux_missing_teacher = 0
+        skipped_aux_missing_router = 0
+        skipped_aux_missing_alignment = 0
 
         for start, end in _iter_batch_indices(args.nsamples, args.batch_size):
             batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
@@ -262,12 +265,19 @@ def update_block_parameters_with_loss(
                         aug_loss = loss_func(fp_targets_aug[start:end], quant_out)
 
                     aux_loss = torch.zeros_like(main_loss)
-                    if aux_enabled and teacher_router_labels is not None and router_logits is not None:
-                        teacher_logits = teacher_router_labels[0][start:end, :, :aux_topk]
-                        teacher_indices = teacher_router_labels[1][start:end, :, :aux_topk]
-                        aligned_router_logits = _align_router_logits_for_teacher(router_logits, teacher_indices, logger=logger)
-                        if aligned_router_logits is not None:
-                            aux_loss = compute_topk_mse_loss(aligned_router_logits.float(), teacher_logits, teacher_indices)
+                    if aux_enabled:
+                        if teacher_router_labels is None:
+                            skipped_aux_missing_teacher += 1
+                        elif router_logits is None:
+                            skipped_aux_missing_router += 1
+                        else:
+                            teacher_logits = teacher_router_labels[0][start:end, :, :aux_topk]
+                            teacher_indices = teacher_router_labels[1][start:end, :, :aux_topk]
+                            aligned_router_logits = _align_router_logits_for_teacher(router_logits, teacher_indices, logger=logger)
+                            if aligned_router_logits is None:
+                                skipped_aux_missing_alignment += 1
+                            else:
+                                aux_loss = compute_topk_mse_loss(aligned_router_logits.float(), teacher_logits, teacher_indices)
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
 
@@ -307,6 +317,14 @@ def update_block_parameters_with_loss(
             f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} "
             f"aux_loss:{_fmt_metric(aux_mean)} total_loss:{_fmt_metric(total_mean)} norm:{_fmt_metric(norm_mean)}"
         )
+
+        if aux_enabled and (skipped_aux_missing_teacher or skipped_aux_missing_router or skipped_aux_missing_alignment):
+            logger.warning(
+                f"[BlockUpdate] layer {layer_idx} epoch {update_epoch} auxiliary router loss skipped "
+                f"for teacher_missing={skipped_aux_missing_teacher} batches, "
+                f"router_missing={skipped_aux_missing_router} batches, "
+                f"alignment_missing={skipped_aux_missing_alignment} batches"
+            )
 
     return final_total
 
