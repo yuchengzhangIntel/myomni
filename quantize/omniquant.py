@@ -732,8 +732,8 @@ def omniquant(
     logger=None,
     train_shared_gate=False,
     train_gate_lora=False,
-    shared_gate_lr=1e-4,
-    gate_lora_lr=1e-4,
+    shared_gate_lr=1e-5,
+    gate_lora_lr=1e-5,
     lora_r=8,
     lora_alpha=16,
     # Router Calibration parameters

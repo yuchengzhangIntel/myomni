@@ -440,9 +440,10 @@ def main():
                         help="Train shared_expert_gate layers during calibration (only applies to Qwen MoE variants that expose shared_expert_gate)")
     parser.add_argument("--train_gate_lora", default=False, action="store_true",
                         help="Apply LoRA to mlp.gate (router) layers and train them (for MoE models)")
-    parser.add_argument("--shared_gate_lr", type=float, default=1e-4,
-                        help="Learning rate for shared_expert_gate training")
-    parser.add_argument("--gate_lora_lr", type=float, default=1e-4, help="Learning rate for LoRA gate training")
+    parser.add_argument("--shared_gate_lr", type=float, default=1e-5,
+                        help="Learning rate for shared_expert_gate updates")
+    parser.add_argument("--gate_lora_lr", type=float, default=1e-5,
+                        help="Learning rate for router gate updates (or gate LoRA when supported)")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank for gate training")
     parser.add_argument("--lora_alpha", type=float, default=16, help="LoRA alpha (scaling factor) for gate training")
     parser.add_argument("--use_linear_lora", default=False, action="store_true",
