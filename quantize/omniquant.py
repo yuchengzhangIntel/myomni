@@ -209,6 +209,20 @@ def build_block_update_param_groups(module, args):
             param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
             selected_params.extend(shared_gate_params)
 
+    if getattr(args, "block_update_expert", False):
+        moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
+        moe_lwc_params, moe_lora_params = collect_stage_parameters(
+            module,
+            moe_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if moe_lwc_params:
+            param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(moe_lwc_params)
+        if moe_lora_params:
+            param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(moe_lora_params)
+
     return dedupe_parameters(selected_params), param_groups
 
 
@@ -971,7 +985,11 @@ def omniquant(
             and get_moe_experts_module(layer.mlp) is not None
         )
         layer_attn_epochs = get_attention_epochs(args, i)
-        base_train_current_layer = args.epochs > 0 or (use_decoupled_moe_training and layer_attn_epochs > 0)
+        base_train_current_layer = (
+            args.epochs > 0 
+            or (use_decoupled_moe_training and layer_attn_epochs > 0)
+            or (getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0)
+        )
         max_train_layers = getattr(args, "max_train_layers", -1)
         within_train_limit = max_train_layers < 0 or i < max_train_layers
         train_current_layer = base_train_current_layer and within_train_limit

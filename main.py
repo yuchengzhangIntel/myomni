@@ -479,6 +479,8 @@ def main():
                         help="Allow student-loss block update stage to update attention LWC/LoRA parameters")
     parser.add_argument("--block_update_router", default=False, action="store_true",
                         help="Allow student-loss block update stage to update router/shared-gate parameters")
+    parser.add_argument("--block_update_expert", default=False, action="store_true",
+                        help="Allow student-loss block update stage to update experts parameters")
     parser.add_argument("--block_aux_loss", default=False, action="store_true",
                         help="Enable router auxiliary loss to keep quant router close to FP16 routing")
     parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
@@ -507,7 +509,9 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     # check
-    if args.epochs > 0 or args.attn_epochs > 0:
+    if getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0:
+        has_any_trainable_mechanism = True
+    elif args.epochs > 0 or args.attn_epochs > 0:
         has_any_trainable_mechanism = any([
             args.lwc,
             args.let,
@@ -578,6 +582,7 @@ def main():
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
     logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
     logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
+    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
@@ -749,6 +754,7 @@ def main():
                 + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
     logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
     logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
+    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
