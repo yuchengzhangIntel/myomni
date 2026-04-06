@@ -159,10 +159,10 @@ def collect_router_and_shared_gate_parameters(module):
     for name, param in module.named_parameters():
         if id(param) in seen:
             continue
-        if name.startswith("mlp.gate."):
+        if name.startswith("mlp.gate.") or name == "mlp.gate.weight":
             router_params.append(param)
             seen.add(id(param))
-        elif name.startswith("mlp.shared_expert_gate."):
+        elif name.startswith("mlp.shared_expert_gate.") or name == "mlp.shared_expert_gate.weight":
             shared_gate_params.append(param)
             seen.add(id(param))
 
