@@ -472,10 +472,14 @@ def main():
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
     parser.add_argument("--block_eval_interval", type=int, default=0,
                         help="Run student-only block-wise evaluation every N MoE epochs; disabled when < 1")
-    parser.add_argument("--block_loss_attn", default=False, action="store_true",
-                        help="Allow in-step block-wise loss to update attention LWC/LoRA parameters")
-    parser.add_argument("--block_loss_router", default=False, action="store_true",
-                        help="Allow in-step block-wise loss to update router and shared-gate parameters")
+    parser.add_argument("--block_loss_attn", default=True, action="store_true",
+                        help="Allow in-step block-wise loss to update attention LWC/LoRA parameters (default: ON)")
+    parser.add_argument("--disable_block_loss_attn", dest="block_loss_attn", action="store_false",
+                        help="Disable in-step block-wise loss updates for attention LWC/LoRA parameters")
+    parser.add_argument("--block_loss_router", default=True, action="store_true",
+                        help="Allow in-step block-wise loss to update router and shared-gate parameters (default: ON)")
+    parser.add_argument("--disable_block_loss_router", dest="block_loss_router", action="store_false",
+                        help="Disable in-step block-wise loss updates for router and shared-gate parameters")
     parser.add_argument("--block_loss_expert", default=False, action="store_true",
                         help="Allow in-step block-wise loss to update routed/shared expert parameters")
     parser.add_argument("--expert_loss_attn", default=False, action="store_true",
