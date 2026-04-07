@@ -472,20 +472,28 @@ def main():
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
     parser.add_argument("--block_eval_interval", type=int, default=0,
                         help="Run student-only block-wise evaluation every N MoE epochs; disabled when < 1")
-    parser.add_argument("--enable_block_loss_update", default=False, action="store_true",
-                        help="Enable post-MoE student-loss block-wise update stage (pre-eval -> update -> post-eval)")
+    parser.add_argument("--block_loss_attn", default=False, action="store_true",
+                        help="Allow in-step block-wise loss to update attention LWC/LoRA parameters")
+    parser.add_argument("--block_loss_router", default=False, action="store_true",
+                        help="Allow in-step block-wise loss to update router and shared-gate parameters")
+    parser.add_argument("--block_loss_expert", default=False, action="store_true",
+                        help="Allow in-step block-wise loss to update routed/shared expert parameters")
+    parser.add_argument("--expert_loss_attn", default=False, action="store_true",
+                        help="Allow dynamic expert self-supervision loss to update attention LWC/LoRA parameters")
+    parser.add_argument("--enable_block_loss_update", dest="enable_block_loss_update", default=False, action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--block_update_epochs", type=int, default=1,
-                        help="Epoch count for post-MoE block-wise update stage")
-    parser.add_argument("--block_update_attn", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update attention LWC/LoRA parameters")
-    parser.add_argument("--block_update_router", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update router/shared-gate parameters")
-    parser.add_argument("--block_update_expert", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update experts parameters")
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--block_update_attn", dest="block_loss_attn", default=False, action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--block_update_router", dest="block_loss_router", default=False, action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--block_update_expert", dest="block_loss_expert", default=False, action="store_true",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--block_aux_loss", default=False, action="store_true",
-                        help="Enable router auxiliary loss to keep quant router close to FP16 routing")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
-                        help="Weight for router auxiliary loss in block-wise update stage")
+                        help=argparse.SUPPRESS)
     parser.add_argument("--max_train_layers", type=int, default=-1,
                         help="Train at most the first N layers; use -1 for all layers, 1 for first block only")
 
@@ -510,23 +518,35 @@ def main():
     torch.cuda.manual_seed(args.seed)
 
     # check
-    if getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0:
-        has_any_trainable_mechanism = True
-    elif args.epochs > 0 or args.attn_epochs > 0:
+    args._deprecated_cli_flags = []
+    if getattr(args, "enable_block_loss_update", False):
+        args._deprecated_cli_flags.append("--enable_block_loss_update")
+    if getattr(args, "block_update_epochs", 1) != 1:
+        args._deprecated_cli_flags.append("--block_update_epochs")
+    if getattr(args, "block_aux_loss", False):
+        args._deprecated_cli_flags.append("--block_aux_loss")
+    if float(getattr(args, "block_aux_loss_weight", 0.1)) != 0.1:
+        args._deprecated_cli_flags.append("--block_aux_loss_weight")
+
+    if args.epochs > 0 or args.attn_epochs > 0:
         has_any_trainable_mechanism = any([
             args.lwc,
             args.let,
             args.use_linear_lora,
             args.train_gate_lora,
             args.train_shared_gate,
-            args.enable_block_loss_update,
             args.calibrate_router,
+            args.block_loss_attn,
+            args.block_loss_router,
+            args.block_loss_expert,
+            args.expert_loss_attn,
         ])
         if not has_any_trainable_mechanism:
             raise ValueError(
                 "Training epochs are set, but no trainable mechanism is enabled. "
                 "Enable at least one of --lwc, --let, --use_linear_lora, --train_gate_lora, "
-                "--train_shared_gate, --enable_block_loss_update, or --calibrate_router."
+                "--train_shared_gate, --block_loss_attn, --block_loss_router, --block_loss_expert, "
+                "--expert_loss_attn, or --calibrate_router."
             )
 
     if args.use_linear_lora and args.let:
@@ -561,6 +581,11 @@ def main():
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
+    if args._deprecated_cli_flags:
+        logger.warning(
+            "Deprecated decoupled MoE CLI flags are ignored in the Qwen/DeepSeek joint training path: %s",
+            ", ".join(sorted(set(args._deprecated_cli_flags))),
+        )
 
     # === Training Config Summary (Begin) ===
     logger.info("=" * 60)
@@ -579,13 +604,10 @@ def main():
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
-    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
-                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
-    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
-    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
-    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
-    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
-                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Block Loss Attention      : {'ON' if args.block_loss_attn else 'OFF'}")
+    logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
+    logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
+    logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
 
@@ -751,13 +773,10 @@ def main():
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
-    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
-                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
-    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
-    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
-    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
-    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
-                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Block Loss Attention      : {'ON' if args.block_loss_attn else 'OFF'}")
+    logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
+    logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
+    logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results

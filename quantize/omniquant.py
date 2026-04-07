@@ -32,10 +32,8 @@ from quantize.moe_utils import (
     select_top_n_experts,
 )
 from quantize.block_evaluator import (
-    capture_teacher_router_labels,
     compute_fp_block_targets,
     evaluate_block_loss_modes,
-    update_block_parameters_with_loss,
 )
 
 
@@ -226,6 +224,119 @@ def build_block_update_param_groups(module, args):
     return dedupe_parameters(selected_params), param_groups
 
 
+def _scope_enabled(args, primary_name, legacy_name=None):
+    if hasattr(args, primary_name):
+        return bool(getattr(args, primary_name))
+    if legacy_name is not None and hasattr(args, legacy_name):
+        return bool(getattr(args, legacy_name))
+    return False
+
+
+def build_block_loss_param_groups(module, args):
+    attention_prefixes = ("self_attn.",)
+    selected_params = []
+    param_groups = []
+
+    if _scope_enabled(args, "block_loss_attn", "block_update_attn"):
+        attn_lwc_params, attn_lora_params = collect_stage_parameters(
+            module,
+            attention_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if attn_lwc_params:
+            param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(attn_lwc_params)
+        if attn_lora_params:
+            param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(attn_lora_params)
+
+    if _scope_enabled(args, "block_loss_router", "block_update_router"):
+        router_params, shared_gate_params = collect_router_and_shared_gate_parameters(module)
+        if router_params:
+            param_groups.append({"params": router_params, "lr": args.gate_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(router_params)
+        if shared_gate_params:
+            param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
+            selected_params.extend(shared_gate_params)
+
+    if _scope_enabled(args, "block_loss_expert", "block_update_expert"):
+        moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
+        moe_lwc_params, moe_lora_params = collect_stage_parameters(
+            module,
+            moe_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if moe_lwc_params:
+            param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(moe_lwc_params)
+        if moe_lora_params:
+            param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(moe_lora_params)
+
+    return dedupe_parameters(selected_params), param_groups
+
+
+def build_expert_self_supervision_param_groups(module, args):
+    attention_prefixes = ("self_attn.",)
+    moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
+    selected_params = []
+    param_groups = []
+
+    if getattr(args, "expert_loss_attn", False):
+        attn_lwc_params, attn_lora_params = collect_stage_parameters(
+            module,
+            attention_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if attn_lwc_params:
+            param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(attn_lwc_params)
+        if attn_lora_params:
+            param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(attn_lora_params)
+
+    moe_lwc_params, moe_lora_params = collect_stage_parameters(
+        module,
+        moe_prefixes,
+        include_linear_lora=getattr(args, "use_linear_lora", False),
+    )
+    if moe_lwc_params:
+        param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+        selected_params.extend(moe_lwc_params)
+    if moe_lora_params:
+        param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+        selected_params.extend(moe_lora_params)
+
+    return dedupe_parameters(selected_params), param_groups
+
+
+def build_block_update_param_groups(module, args):
+    return build_block_loss_param_groups(module, args)
+
+
+def merge_param_groups(*param_group_lists):
+    merged_groups = []
+    grouped_params = {}
+    seen = set()
+
+    for param_groups in param_group_lists:
+        for group in param_groups:
+            key = (group.get("lr", 0.0), group.get("weight_decay", 0.0))
+            if key not in grouped_params:
+                grouped_params[key] = {"params": [], "lr": key[0], "weight_decay": key[1]}
+                merged_groups.append(grouped_params[key])
+            for param in group["params"]:
+                if id(param) in seen:
+                    continue
+                grouped_params[key]["params"].append(param)
+                seen.add(id(param))
+
+    merged_params = []
+    for group in merged_groups:
+        merged_params.extend(group["params"])
+    return merged_params, merged_groups
+
+
 def compute_attention_outputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
     normed_hidden_states = layer.input_layernorm(hidden_states)
     return extract_hidden_states(call_layer_forward(
@@ -270,47 +381,119 @@ def get_attention_epochs(args, layer_idx=None):
     return base_attn_epochs + max(layer_idx, 0) // 2
 
 
-def build_moe_label_cache(layer, fp_inputs, layer_kwargs, attention_mask, position_ids, top_n):
+def _get_batch_attention_mask(attention_mask_batch, start, end):
+    if attention_mask_batch is None:
+        return None
+    return attention_mask_batch[: end - start]
+
+
+def _router_output_to_scores(moe_module, gate_output):
+    if isinstance(gate_output, tuple):
+        return gate_output[0].float()
+    if isinstance(moe_module.gate, nn.Linear):
+        return torch.softmax(gate_output.float(), dim=-1)
+    return torch.sigmoid(gate_output.float())
+
+
+def compute_fp_mlp_inputs(
+    layer,
+    fp_inputs,
+    layer_kwargs,
+    attention_mask_batch,
+    position_ids,
+    traincast,
+    batch_size,
+):
+    fp_mlp_inputs = torch.zeros_like(fp_inputs)
+    with torch.no_grad():
+        for start in range(0, fp_inputs.shape[0], batch_size):
+            end = min(start + batch_size, fp_inputs.shape[0])
+            batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
+            with traincast():
+                _, _, mlp_inputs = compute_mlp_inputs(
+                    layer,
+                    fp_inputs[start:end],
+                    layer_kwargs,
+                    attention_mask=batch_attention_mask,
+                    position_ids=position_ids,
+                )
+            fp_mlp_inputs[start:end] = mlp_inputs
+    return fp_mlp_inputs
+
+
+def forward_layer_with_moe_state(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
+    captured = {}
+
+    def _capture_mlp_inputs(_module, inputs):
+        captured["mlp_inputs"] = inputs[0]
+
+    def _capture_gate_output(_module, _inputs, output):
+        captured["gate_output"] = output
+
+    mlp_handle = None
+    gate_handle = None
+    if hasattr(layer, "mlp"):
+        mlp_handle = layer.mlp.register_forward_pre_hook(_capture_mlp_inputs)
+        if hasattr(layer.mlp, "gate"):
+            gate_handle = layer.mlp.gate.register_forward_hook(_capture_gate_output)
+
+    try:
+        outputs = call_layer_forward(
+            layer,
+            hidden_states,
+            layer_kwargs=layer_kwargs,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+    finally:
+        if gate_handle is not None:
+            gate_handle.remove()
+        if mlp_handle is not None:
+            mlp_handle.remove()
+
+    mlp_inputs = captured.get("mlp_inputs")
+    gate_output = captured.get("gate_output")
+    router_scores = None
+    if gate_output is not None:
+        router_scores = _router_output_to_scores(layer.mlp, gate_output)
+
+    return extract_hidden_states(outputs), mlp_inputs, router_scores
+
+
+def build_dynamic_moe_label_cache(layer, fp_mlp_inputs, top_indices, top_weights, use_router_weight_in_loss):
     label_cache = []
     shared_expert = get_shared_expert_module(layer.mlp)
     experts_module = get_moe_experts_module(layer.mlp)
 
     with torch.no_grad():
-        for sample_idx in range(fp_inputs.shape[0]):
-            sample_inputs = fp_inputs[sample_idx].unsqueeze(0)
-            _, _, mlp_inputs = compute_mlp_inputs(
-                layer,
-                sample_inputs,
-                layer_kwargs,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
-            flat_mlp_inputs = mlp_inputs.reshape(-1, mlp_inputs.shape[-1])
-            router_scores = compute_router_scores(layer.mlp, flat_mlp_inputs)
-            top_indices, top_weights = select_top_n_experts(router_scores, top_n)
-
+        for batch_idx in range(fp_mlp_inputs.shape[0]):
+            sample_inputs = fp_mlp_inputs[batch_idx]
+            sample_top_indices = top_indices[batch_idx]
+            sample_top_weights = top_weights[batch_idx]
             sample_cache = {
                 "expert_labels": {},
                 "shared_labels": None,
             }
 
-            for expert_idx_tensor in torch.unique(top_indices):
+            for expert_idx_tensor in torch.unique(sample_top_indices):
                 expert_idx = int(expert_idx_tensor.item())
-                token_idx, top_pos = torch.where(top_indices == expert_idx)
+                token_idx, top_pos = torch.where(sample_top_indices == expert_idx)
                 labels = compute_expert_down_proj_output(
                     experts_module,
                     expert_idx,
-                    flat_mlp_inputs[token_idx],
+                    sample_inputs[token_idx],
                 )
-                sample_cache["expert_labels"][expert_idx] = {
-                    "token_idx": pin_cpu_tensor(token_idx),
-                    "weights": pin_cpu_tensor(top_weights[token_idx, top_pos]),
-                    "labels": pin_cpu_tensor(labels),
+                cached_values = {
+                    "token_idx": token_idx.detach(),
+                    "labels": labels.detach(),
                 }
+                if use_router_weight_in_loss:
+                    cached_values["weights"] = sample_top_weights[token_idx, top_pos].detach()
+                sample_cache["expert_labels"][expert_idx] = cached_values
 
             if shared_expert is not None:
-                shared_outputs = extract_hidden_states(call_layer_forward(shared_expert, flat_mlp_inputs))
-                sample_cache["shared_labels"] = pin_cpu_tensor(shared_outputs)
+                shared_outputs = extract_hidden_states(call_layer_forward(shared_expert, sample_inputs))
+                sample_cache["shared_labels"] = shared_outputs.detach()
 
             label_cache.append(sample_cache)
 
@@ -340,6 +523,7 @@ def compute_moe_self_supervision_loss(
     experts_module = get_moe_experts_module(qlayer.mlp)
     shared_expert = get_shared_expert_module(qlayer.mlp)
     expert_loss_terms = {}
+    shared_loss_terms = []
     loss_terms = []
 
     for batch_idx, sample_cache in enumerate(batch_label_cache):
@@ -353,7 +537,7 @@ def compute_moe_self_supervision_loss(
                 sample_inputs[token_idx],
             )
             expert_loss = (student_labels.float() - teacher_labels.float()).pow(2).mean(dim=-1)
-            if use_router_weight_in_loss:
+            if use_router_weight_in_loss and "weights" in cached_values:
                 weights = cached_values["weights"].to(sample_inputs.device, non_blocking=True).float()
                 expert_loss = expert_loss * weights
             expert_loss_terms.setdefault(expert_idx, []).append(expert_loss)
@@ -362,16 +546,61 @@ def compute_moe_self_supervision_loss(
             shared_labels = sample_cache["shared_labels"].to(sample_inputs.device, non_blocking=True)
             student_shared = extract_hidden_states(call_layer_forward(shared_expert, sample_inputs))
             shared_loss = (student_shared.float() - shared_labels.float()).pow(2).mean(dim=-1)
-            loss_terms.append(shared_loss.mean())
+            shared_loss_terms.append(shared_loss)
 
     for expert_terms in expert_loss_terms.values():
         loss_terms.append(torch.cat(expert_terms).mean())
+
+    if shared_loss_terms:
+        loss_terms.append(torch.cat(shared_loss_terms).mean())
 
     if not loss_terms:
         loss_device = mlp_inputs.device if precomputed_mlp_inputs is not None else quant_inputs.device
         return torch.tensor(0.0, device=loss_device, requires_grad=True)
 
     return torch.stack(loss_terms).sum()
+
+
+def backward_loss_to_selected_params(loss, selected_params, scaler=None, retain_graph=False):
+    if not selected_params:
+        return
+    backward_loss = scaler.scale(loss) if scaler is not None else loss
+    torch.autograd.backward(backward_loss, retain_graph=retain_graph, inputs=selected_params)
+
+
+def step_joint_optimizer(optimizer, selected_params, clip_grad_max_norm, scaler=None):
+    if not selected_params:
+        return torch.tensor(0.0)
+
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        if clip_grad_max_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(selected_params, clip_grad_max_norm)
+        else:
+            grad_norm = utils.ampscaler_get_grad_norm(selected_params)
+
+        grad_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        if not math.isfinite(grad_value):
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            return torch.tensor(0.0, device=selected_params[0].device)
+
+        scaler.step(optimizer)
+        scaler.update()
+        return grad_norm.detach()
+
+    if clip_grad_max_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(selected_params, clip_grad_max_norm)
+    else:
+        grad_norm = utils.ampscaler_get_grad_norm(selected_params)
+
+    grad_value = float(grad_norm.detach().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+    if not math.isfinite(grad_value):
+        optimizer.zero_grad(set_to_none=True)
+        return torch.tensor(0.0, device=selected_params[0].device)
+
+    optimizer.step()
+    return grad_norm.detach()
 
 
 def train_decoupled_moe_layer(
@@ -486,137 +715,138 @@ def train_decoupled_moe_layer(
         traincast,
     )
 
-    routing_top_k = get_moe_top_k(layer.mlp)
-    if routing_top_k is None:
-        routing_top_k = 1
-    max_experts = None
-    if hasattr(layer.mlp, "gate"):
-        max_experts = getattr(layer.mlp.gate, "out_features", None)
-        if max_experts is None and hasattr(layer.mlp.gate, "weight"):
-            max_experts = layer.mlp.gate.weight.shape[0]
-    teacher_label_topk = max(routing_top_k, getattr(args, "k_loss", routing_top_k))
-    if max_experts is not None:
-        teacher_label_topk = min(teacher_label_topk, int(max_experts))
-    teacher_router_labels = capture_teacher_router_labels(
+    fp_mlp_inputs = compute_fp_mlp_inputs(
         layer,
         fp_inps,
-        quant_inps.device,
         layer_kwargs,
-        topk=teacher_label_topk,
-        logger=logger,
+        attention_mask_batch,
+        position_ids,
+        traincast,
+        args.batch_size,
     )
-    if teacher_router_labels is None:
-        logger.warning(
-            f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, auxiliary router loss will be skipped"
-        )
 
     eval_interval = getattr(args, "block_eval_interval", 0)
     periodic_eval_enabled = eval_interval >= 1
-    update_stage_enabled = getattr(args, "enable_block_loss_update", False)
-    update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
-    block_aux_enabled = getattr(args, "block_aux_loss", False)
-    block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
-    if block_aux_enabled and teacher_router_labels is None:
-        logger.warning(f"[BlockUpdate] Layer {layer_idx}: block auxiliary router loss requested but teacher labels are unavailable")
-
     top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
-    logger.info(f"[Decoupled MoE] Layer {layer_idx}: building CPU label cache with top_n={top_n}")
-    label_cache = build_moe_label_cache(
-        layer,
-        fp_inps,
-        layer_kwargs,
-        attention_mask,
-        position_ids,
-        top_n,
-    )
+    block_selected_params, block_param_groups = build_block_loss_param_groups(qlayer, args)
+    expert_selected_params, expert_param_groups = build_expert_self_supervision_param_groups(qlayer, args)
+    joint_selected_params, joint_param_groups = merge_param_groups(block_param_groups, expert_param_groups)
 
-    moe_lwc_params, moe_lora_params = collect_stage_parameters(
-        qlayer,
-        moe_prefixes,
-        include_linear_lora=getattr(args, "use_linear_lora", False),
-    )
-    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
-    moe_param_groups = []
-    if attn_lwc_params:
-        moe_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if attn_lora_params:
-        moe_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-    if moe_lwc_params:
-        moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if moe_lora_params:
-        moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-
-    if moe_param_groups and args.epochs > 0:
-        joint_attn_enabled = bool(joint_moe_attn_params)
+    if joint_param_groups and args.epochs > 0:
         logger.info(
-            f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs"
-            + (" with joint attention updates" if joint_attn_enabled else "")
+            f"[Decoupled Joint] Layer {layer_idx}: training block loss + dynamic expert self-supervision for {args.epochs} epochs"
         )
-        moe_optimizer = torch.optim.AdamW(moe_param_groups, weight_decay=0)
-        moe_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-        moe_clip_params = dedupe_parameters(attn_lwc_params + attn_lora_params + moe_lwc_params + moe_lora_params)
+        joint_optimizer = torch.optim.AdamW(joint_param_groups, weight_decay=0)
+        grad_scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
+
         for epoch in range(args.epochs):
-            loss_list = []
-            norm_list = []
+            total_loss_items = []
+            block_loss_items = []
+            expert_loss_items = []
+            norm_items = []
+
             for start in range(0, args.nsamples, args.batch_size):
                 end = min(start + args.batch_size, args.nsamples)
-                batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
-                moe_optimizer.zero_grad()
-                with traincast():
-                    smooth_and_quant_temporary(qlayer, args, isllama=True)
-                with traincast():
-                    if joint_attn_enabled:
-                        loss = compute_moe_self_supervision_loss(
+                batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
+                joint_optimizer.zero_grad(set_to_none=True)
+
+                try:
+                    with traincast():
+                        smooth_and_quant_temporary(qlayer, args, isllama=True)
+                        student_block_outputs, student_mlp_inputs, router_scores = forward_layer_with_moe_state(
                             qlayer,
                             quant_inps[start:end],
-                            label_cache[start:end],
                             layer_kwargs,
-                            batch_attention_mask,
-                            position_ids,
+                            attention_mask=batch_attention_mask,
+                            position_ids=position_ids,
+                        )
+
+                        block_loss = loss_func(student_block_outputs, fp_block_targets[start:end])
+                        if fp_block_targets_aug is not None:
+                            block_loss = block_loss + loss_func(student_block_outputs, fp_block_targets_aug[start:end])
+
+                        if student_mlp_inputs is None:
+                            raise RuntimeError(f"Layer {layer_idx}: failed to capture MLP inputs during student forward")
+                        if router_scores is None:
+                            raise RuntimeError(f"Layer {layer_idx}: failed to capture router scores during student forward")
+
+                        flat_router_scores = router_scores.reshape(-1, router_scores.shape[-1])
+                        top_indices, top_weights = select_top_n_experts(flat_router_scores, top_n)
+                        batch_size = student_mlp_inputs.shape[0]
+                        seq_len = student_mlp_inputs.shape[1]
+                        top_indices = top_indices.reshape(batch_size, seq_len, -1)
+                        top_weights = top_weights.reshape(batch_size, seq_len, -1)
+
+                        teacher_label_cache = build_dynamic_moe_label_cache(
+                            layer,
+                            fp_mlp_inputs[start:end],
+                            top_indices,
+                            top_weights,
                             use_router_weight_in_loss,
                         )
-                    else:
-                        with torch.no_grad():
-                            _, _, detached_mlp_inputs = compute_mlp_inputs(
-                                qlayer,
-                                quant_inps[start:end],
-                                layer_kwargs,
-                                attention_mask=batch_attention_mask,
-                                position_ids=position_ids,
-                            )
-                            detached_mlp_inputs = detached_mlp_inputs.detach()
-                        loss = compute_moe_self_supervision_loss(
+
+                        expert_loss_inputs = student_mlp_inputs if getattr(args, "expert_loss_attn", False) else student_mlp_inputs.detach()
+                        expert_loss = compute_moe_self_supervision_loss(
                             qlayer,
-                            quant_inps[start:end],
-                            label_cache[start:end],
-                            layer_kwargs,
-                            batch_attention_mask,
-                            position_ids,
-                            use_router_weight_in_loss,
-                            precomputed_mlp_inputs=detached_mlp_inputs,
+                            quant_inputs=None,
+                            batch_label_cache=teacher_label_cache,
+                            layer_kwargs={},
+                            attention_mask=None,
+                            position_ids=None,
+                            use_router_weight_in_loss=use_router_weight_in_loss,
+                            precomputed_mlp_inputs=expert_loss_inputs,
                         )
-                loss_list.append(loss.detach().cpu())
-                norm = moe_scaler(
-                    loss,
-                    moe_optimizer,
-                    clip_grad=clip_grad_max_norm,
-                    parameters=moe_clip_params,
-                )
-                if norm is None:
-                    norm = torch.tensor(0.0, device=quant_inps.device)
-                norm = norm.cpu()
+                        total_loss = block_loss + expert_loss
+
+                    if not torch.isfinite(total_loss.detach()):
+                        logger.warning(
+                            f"[Decoupled Joint] Layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: non-finite total loss, skipping step"
+                        )
+                        continue
+
+                    backward_loss_to_selected_params(
+                        block_loss,
+                        block_selected_params,
+                        scaler=grad_scaler,
+                        retain_graph=bool(expert_selected_params),
+                    )
+                    backward_loss_to_selected_params(
+                        expert_loss,
+                        expert_selected_params,
+                        scaler=grad_scaler,
+                        retain_graph=False,
+                    )
+                    norm = step_joint_optimizer(
+                        joint_optimizer,
+                        joint_selected_params,
+                        clip_grad_max_norm,
+                        scaler=grad_scaler,
+                    )
+                finally:
+                    clear_temp_variable(qlayer)
+
+                norm = norm.cpu() if isinstance(norm, torch.Tensor) else torch.tensor(float(norm))
                 if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
                     logger.info(
-                        f"[GradClip] Decoupled MoE layer {layer_idx} epoch {epoch} "
+                        f"[GradClip] Decoupled Joint layer {layer_idx} epoch {epoch} "
                         f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
                     )
-                norm_list.append(norm)
-                clear_temp_variable(qlayer)
 
-            loss_mean = torch.stack(loss_list).mean()
-            norm_mean = torch.stack(norm_list).mean()
-            logger.info(f"[Decoupled MoE] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean}")
-            final_stage_loss = loss_mean.item()
+                block_loss_items.append(block_loss.detach().cpu())
+                expert_loss_items.append(expert_loss.detach().cpu())
+                total_loss_items.append(total_loss.detach().cpu())
+                norm_items.append(norm)
+
+            if total_loss_items:
+                block_mean = torch.stack(block_loss_items).mean()
+                expert_mean = torch.stack(expert_loss_items).mean()
+                total_mean = torch.stack(total_loss_items).mean()
+                norm_mean = torch.stack(norm_items).mean() if norm_items else torch.tensor(0.0)
+                logger.info(
+                    f"[Decoupled Joint] Layer {layer_idx} epoch {epoch} "
+                    f"block_loss:{block_mean} expert_loss:{expert_mean} total_loss:{total_mean} norm:{norm_mean}"
+                )
+                final_stage_loss = total_mean.item()
 
             if periodic_eval_enabled and (epoch + 1) % eval_interval == 0:
                 evaluate_block_loss_modes(
@@ -635,92 +865,9 @@ def train_decoupled_moe_layer(
                     epoch_idx=epoch,
                     smooth_is_llama=True,
                 )
-        del moe_optimizer
 
-    if update_stage_enabled:
-        logger.info(f"[BlockUpdate] Layer {layer_idx}: pre-update evaluation")
-        evaluate_block_loss_modes(
-            qlayer=qlayer,
-            args=args,
-            loss_func=loss_func,
-            quant_inputs=quant_inps,
-            fp_targets=fp_block_targets,
-            fp_targets_aug=fp_block_targets_aug,
-            layer_kwargs=layer_kwargs,
-            attention_mask_batch=attention_mask_batch,
-            position_ids=position_ids,
-            traincast=traincast,
-            logger=logger,
-            layer_idx=layer_idx,
-            epoch_idx="pre_update",
-            smooth_is_llama=True,
-        )
+        del joint_optimizer
 
-        selected_params, update_param_groups = build_block_update_param_groups(qlayer, args)
-
-        if not selected_params:
-            logger.warning(f"[BlockUpdate] Layer {layer_idx}: no trainable parameters selected, skipping update stage")
-        else:
-            original_requires_grad = {
-                id(param): param.requires_grad
-                for param in qlayer.parameters()
-            }
-            for param in qlayer.parameters():
-                param.requires_grad = False
-            for param in selected_params:
-                param.requires_grad = True
-
-            update_optimizer = torch.optim.AdamW(update_param_groups, weight_decay=0)
-            update_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-
-            final_stage_loss = update_block_parameters_with_loss(
-                qlayer=qlayer,
-                args=args,
-                optimizer=update_optimizer,
-                loss_scaler=update_scaler,
-                clip_parameters=selected_params,
-                loss_func=loss_func,
-                quant_inputs=quant_inps,
-                fp_targets=fp_block_targets,
-                fp_targets_aug=fp_block_targets_aug,
-                teacher_router_labels=teacher_router_labels,
-                aux_enabled=block_aux_enabled,
-                aux_weight=block_aux_weight,
-                aux_topk=teacher_label_topk,
-                layer_kwargs=layer_kwargs,
-                attention_mask_batch=attention_mask_batch,
-                position_ids=position_ids,
-                traincast=traincast,
-                logger=logger,
-                layer_idx=layer_idx,
-                smooth_is_llama=True,
-                update_epochs=update_stage_epochs,
-                clip_grad=clip_grad_max_norm,
-            )
-
-            del update_optimizer
-            for param in qlayer.parameters():
-                param.requires_grad = original_requires_grad[id(param)]
-
-        logger.info(f"[BlockUpdate] Layer {layer_idx}: post-update evaluation")
-        evaluate_block_loss_modes(
-            qlayer=qlayer,
-            args=args,
-            loss_func=loss_func,
-            quant_inputs=quant_inps,
-            fp_targets=fp_block_targets,
-            fp_targets_aug=fp_block_targets_aug,
-            layer_kwargs=layer_kwargs,
-            attention_mask_batch=attention_mask_batch,
-            position_ids=position_ids,
-            traincast=traincast,
-            logger=logger,
-            layer_idx=layer_idx,
-            epoch_idx="post_update",
-            smooth_is_llama=True,
-        )
-
-    del label_cache
     return final_stage_loss
 
 def omniquant(
@@ -988,7 +1135,6 @@ def omniquant(
         base_train_current_layer = (
             args.epochs > 0 
             or (use_decoupled_moe_training and layer_attn_epochs > 0)
-            or (getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0)
         )
         max_train_layers = getattr(args, "max_train_layers", -1)
         within_train_limit = max_train_layers < 0 or i < max_train_layers

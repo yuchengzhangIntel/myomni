@@ -19,7 +19,13 @@ from quantize.moe_utils import (  # noqa: E402
     select_top_n_experts,
 )
 from quantize.block_evaluator import evaluate_block_loss_modes  # noqa: E402
-from quantize.omniquant import build_block_update_param_groups, compute_moe_self_supervision_loss, get_attention_epochs  # noqa: E402
+from quantize.omniquant import (  # noqa: E402
+    build_block_update_param_groups,
+    build_dynamic_moe_label_cache,
+    compute_moe_self_supervision_loss,
+    forward_layer_with_moe_state,
+    get_attention_epochs,
+)
 
 
 def build_args():
@@ -491,6 +497,105 @@ def test_moe_self_supervision_loss_backpropagates_to_attention_without_precomput
     assert torch.count_nonzero(qlayer.self_attn.proj.weight.grad).item() > 0
 
 
+def test_build_dynamic_moe_label_cache_follows_current_student_selected_experts():
+    class IdentityExpert(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = scale
+
+        def forward(self, hidden_states):
+            return hidden_states * self.scale
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.experts = nn.ModuleList([
+                IdentityExpert(1.0),
+                IdentityExpert(2.0),
+                IdentityExpert(4.0),
+            ])
+            self.mlp.shared_expert = IdentityExpert(8.0)
+
+    layer = FakeLayer()
+    fp_mlp_inputs = torch.tensor([[[1.0], [3.0]]], dtype=torch.float32)
+    top_indices = torch.tensor([[[2, 1], [1, 2]]], dtype=torch.long)
+    top_weights = torch.tensor([[[0.75, 0.25], [0.6, 0.4]]], dtype=torch.float32)
+
+    label_cache = build_dynamic_moe_label_cache(
+        layer,
+        fp_mlp_inputs,
+        top_indices,
+        top_weights,
+        use_router_weight_in_loss=True,
+    )
+
+    assert set(label_cache[0]["expert_labels"].keys()) == {1, 2}
+    assert 0 not in label_cache[0]["expert_labels"]
+    expert_two_labels = label_cache[0]["expert_labels"][2]["labels"]
+    expert_one_labels = label_cache[0]["expert_labels"][1]["labels"]
+    assert torch.allclose(expert_two_labels, torch.tensor([[4.0], [12.0]]))
+    assert torch.allclose(expert_one_labels, torch.tensor([[2.0], [6.0]]))
+    assert torch.allclose(label_cache[0]["shared_labels"], torch.tensor([[8.0], [24.0]]))
+
+
+def test_forward_layer_with_moe_state_handles_tensor_and_tuple_layer_outputs():
+    class IdentityNorm(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class FakeGate(nn.Module):
+        def forward(self, hidden_states):
+            return torch.softmax(torch.stack([hidden_states[:, 0], hidden_states[:, 1]], dim=-1), dim=-1)
+
+    class FakeMlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = FakeGate()
+
+        def forward(self, hidden_states):
+            _ = self.gate(hidden_states.reshape(-1, hidden_states.shape[-1]))
+            return hidden_states + 1.0
+
+    class TensorReturnLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = IdentityNorm()
+            self.post_attention_layernorm = IdentityNorm()
+            self.self_attn = nn.Identity()
+            self.mlp = FakeMlp()
+
+        def forward(self, hidden_states, **_kwargs):
+            return self.mlp(hidden_states)
+
+    class TupleReturnLayer(TensorReturnLayer):
+        def forward(self, hidden_states, output_router_logits=False, **_kwargs):
+            outputs = (self.mlp(hidden_states),)
+            if output_router_logits:
+                outputs += (torch.ones(hidden_states.shape[0], hidden_states.shape[1], 2),)
+            return outputs
+
+    hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], dtype=torch.float32)
+
+    tensor_out, tensor_mlp_inputs, tensor_router_scores = forward_layer_with_moe_state(
+        TensorReturnLayer(),
+        hidden_states,
+        layer_kwargs={},
+    )
+    tuple_out, tuple_mlp_inputs, tuple_router_scores = forward_layer_with_moe_state(
+        TupleReturnLayer(),
+        hidden_states,
+        layer_kwargs={"output_router_logits": True},
+    )
+
+    assert torch.allclose(tensor_out, hidden_states + 1.0)
+    assert torch.allclose(tuple_out, hidden_states + 1.0)
+    assert torch.allclose(tensor_mlp_inputs, hidden_states)
+    assert torch.allclose(tuple_mlp_inputs, hidden_states)
+    assert tensor_router_scores.shape == (2, 2)
+    assert tuple_router_scores.shape == (2, 2)
+
+
 def test_build_block_update_param_groups_respects_scope_flags():
     class FakeQuantLinear(nn.Module):
         def __init__(self):
@@ -516,15 +621,16 @@ def test_build_block_update_param_groups_respects_scope_flags():
         wd=0.01,
         gate_lora_lr=2e-4,
         shared_gate_lr=3e-4,
-        block_update_attn=False,
-        block_update_router=False,
+        block_loss_attn=False,
+        block_loss_router=False,
+        block_loss_expert=False,
     )
 
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     assert selected_params == []
     assert param_groups == []
 
-    args.block_update_attn = True
+    args.block_loss_attn = True
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     selected_ids = {id(param) for param in selected_params}
     assert id(qlayer.self_attn.q_proj.bound_factor) in selected_ids
@@ -533,8 +639,8 @@ def test_build_block_update_param_groups_respects_scope_flags():
     assert id(qlayer.mlp.gate.weight) not in selected_ids
     assert len(param_groups) == 2
 
-    args.block_update_attn = False
-    args.block_update_router = True
+    args.block_loss_attn = False
+    args.block_loss_router = True
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     selected_ids = {id(param) for param in selected_params}
     assert id(qlayer.self_attn.q_proj.bound_factor) not in selected_ids
