@@ -564,6 +564,11 @@ def compute_moe_self_supervision_loss(
 def backward_loss_to_selected_params(loss, selected_params, scaler=None, retain_graph=False):
     if not selected_params:
         return
+    non_trainable = [param for param in selected_params if not param.requires_grad]
+    if non_trainable:
+        raise RuntimeError(
+            f"Selected parameter scope contains {len(non_trainable)} tensors with requires_grad=False"
+        )
     backward_loss = scaler.scale(loss) if scaler is not None else loss
     torch.autograd.backward(backward_loss, retain_graph=retain_graph, inputs=selected_params)
 
@@ -738,6 +743,12 @@ def train_decoupled_moe_layer(
     block_selected_params, block_param_groups = build_block_loss_param_groups(qlayer, args)
     expert_selected_params, expert_param_groups = build_expert_self_supervision_param_groups(qlayer, args)
     joint_selected_params, joint_param_groups = merge_param_groups(block_param_groups, expert_param_groups)
+    original_requires_grad = {id(param): param.requires_grad for param in qlayer.parameters()}
+
+    if joint_selected_params:
+        selected_param_ids = {id(param) for param in joint_selected_params}
+        for param in qlayer.parameters():
+            param.requires_grad = id(param) in selected_param_ids
 
     if joint_param_groups and args.epochs > 0:
         logger.info(
@@ -902,6 +913,9 @@ def train_decoupled_moe_layer(
                 )
 
         del joint_optimizer
+
+    for param in qlayer.parameters():
+        param.requires_grad = original_requires_grad[id(param)]
 
     return final_stage_loss
 
