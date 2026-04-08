@@ -484,6 +484,8 @@ def main():
                         help="Allow in-step block-wise loss to update routed/shared expert parameters")
     parser.add_argument("--expert_loss_attn", default=False, action="store_true",
                         help="Allow dynamic expert self-supervision loss to update attention LWC/LoRA parameters")
+    parser.add_argument("--joint_moe_debug", default=False, action="store_true",
+                        help="Enable verbose debug logging for the Qwen/DeepSeek joint MoE training path")
     parser.add_argument("--enable_block_loss_update", dest="enable_block_loss_update", default=False, action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--block_update_epochs", type=int, default=1,
@@ -612,6 +614,7 @@ def main():
     logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
     logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
     logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
+    logger.info(f"  Joint MoE Debug Logs      : {'ON' if args.joint_moe_debug else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
 
@@ -781,6 +784,7 @@ def main():
     logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
     logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
     logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
+    logger.info(f"  Joint MoE Debug Logs      : {'ON' if args.joint_moe_debug else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results

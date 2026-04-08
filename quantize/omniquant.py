@@ -809,10 +809,11 @@ def train_decoupled_moe_layer(
     )
 
     if args.aug_loss:
-        logger.warning(
-            f"[Decoupled Joint] Layer {layer_idx}: --aug_loss is ignored for Qwen/DeepSeek joint training; "
-            "teacher block labels use original FP16 layer outputs only"
-        )
+        if getattr(args, "joint_moe_debug", False):
+            logger.warning(
+                f"[Decoupled Joint] Layer {layer_idx}: --aug_loss is ignored for Qwen/DeepSeek joint training; "
+                "teacher block labels use original FP16 layer outputs only"
+            )
         fp_block_targets_aug = None
 
     fp_mlp_inputs = compute_fp_mlp_inputs(
@@ -839,28 +840,29 @@ def train_decoupled_moe_layer(
             param.requires_grad = id(param) in selected_param_ids
 
     if joint_param_groups and args.epochs > 0:
-        logger.info(
-            f"[Decoupled Joint] Layer {layer_idx}: training block loss + dynamic expert self-supervision for {args.epochs} epochs"
-        )
-        logger.info(
-            f"[Decoupled Joint] Layer {layer_idx}: teacher labels come from original FP16 layer; "
-            f"block_loss(attn={bool(block_selected_params and _scope_enabled(args, 'block_loss_attn', 'block_update_attn'))}, "
-            f"router={bool(block_selected_params and _scope_enabled(args, 'block_loss_router', 'block_update_router'))}, "
-            f"experts={bool(block_selected_params and _scope_enabled(args, 'block_loss_expert', 'block_update_expert'))}), "
-            f"expert_loss(attn={bool(getattr(args, 'expert_loss_attn', False))}, experts=True), top_n={top_n}"
-        )
-        logger.info(
-            f"[Decoupled Joint] Layer {layer_idx}: selected params block={len(block_selected_params)} "
-            f"expert={len(expert_selected_params)} merged={len(joint_selected_params)}"
-        )
-        logger.info(
-            f"[Decoupled Joint] Layer {layer_idx}: "
-            + format_parameter_scope_summary(qlayer, block_selected_params, "loss1_block")
-        )
-        logger.info(
-            f"[Decoupled Joint] Layer {layer_idx}: "
-            + format_parameter_scope_summary(qlayer, expert_selected_params, "loss2_expert")
-        )
+        if getattr(args, "joint_moe_debug", False):
+            logger.info(
+                f"[Decoupled Joint] Layer {layer_idx}: training block loss + dynamic expert self-supervision for {args.epochs} epochs"
+            )
+            logger.info(
+                f"[Decoupled Joint] Layer {layer_idx}: teacher labels come from original FP16 layer; "
+                f"block_loss(attn={bool(block_selected_params and _scope_enabled(args, 'block_loss_attn', 'block_update_attn'))}, "
+                f"router={bool(block_selected_params and _scope_enabled(args, 'block_loss_router', 'block_update_router'))}, "
+                f"experts={bool(block_selected_params and _scope_enabled(args, 'block_loss_expert', 'block_update_expert'))}), "
+                f"expert_loss(attn={bool(getattr(args, 'expert_loss_attn', False))}, experts=True), top_n={top_n}"
+            )
+            logger.info(
+                f"[Decoupled Joint] Layer {layer_idx}: selected params block={len(block_selected_params)} "
+                f"expert={len(expert_selected_params)} merged={len(joint_selected_params)}"
+            )
+            logger.info(
+                f"[Decoupled Joint] Layer {layer_idx}: "
+                + format_parameter_scope_summary(qlayer, block_selected_params, "loss1_block")
+            )
+            logger.info(
+                f"[Decoupled Joint] Layer {layer_idx}: "
+                + format_parameter_scope_summary(qlayer, expert_selected_params, "loss2_expert")
+            )
         joint_optimizer = torch.optim.AdamW(joint_param_groups, weight_decay=0)
         grad_scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
 
@@ -910,7 +912,7 @@ def train_decoupled_moe_layer(
                             use_router_weight_in_loss,
                         )
 
-                        if start == 0:
+                        if start == 0 and getattr(args, "joint_moe_debug", False):
                             active_experts = sorted({
                                 expert_idx
                                 for sample_cache in teacher_label_cache
@@ -986,7 +988,7 @@ def train_decoupled_moe_layer(
                 norm_mean = torch.stack(norm_items).mean() if norm_items else torch.tensor(0.0)
                 logger.info(
                     f"[Decoupled Joint] Layer {layer_idx} epoch {epoch} "
-                    f"block_loss:{block_mean} expert_loss:{expert_mean} total_loss:{total_mean} norm:{norm_mean}"
+                    f"loss1:{block_mean} loss2:{expert_mean} norm:{norm_mean}"
                 )
                 final_stage_loss = total_mean.item()
 
