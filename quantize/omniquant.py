@@ -295,17 +295,18 @@ def build_expert_self_supervision_param_groups(module, args):
             param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
             selected_params.extend(attn_lora_params)
 
-    moe_lwc_params, moe_lora_params = collect_stage_parameters(
-        module,
-        moe_prefixes,
-        include_linear_lora=getattr(args, "use_linear_lora", False),
-    )
-    if moe_lwc_params:
-        param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-        selected_params.extend(moe_lwc_params)
-    if moe_lora_params:
-        param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-        selected_params.extend(moe_lora_params)
+    if getattr(args, "expert_loss_expert", False):
+        moe_lwc_params, moe_lora_params = collect_stage_parameters(
+            module,
+            moe_prefixes,
+            include_linear_lora=getattr(args, "use_linear_lora", False),
+        )
+        if moe_lwc_params:
+            param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+            selected_params.extend(moe_lwc_params)
+        if moe_lora_params:
+            param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+            selected_params.extend(moe_lora_params)
 
     return dedupe_parameters(selected_params), param_groups
 
@@ -849,7 +850,7 @@ def train_decoupled_moe_layer(
                 f"block_loss(attn={bool(block_selected_params and _scope_enabled(args, 'block_loss_attn', 'block_update_attn'))}, "
                 f"router={bool(block_selected_params and _scope_enabled(args, 'block_loss_router', 'block_update_router'))}, "
                 f"experts={bool(block_selected_params and _scope_enabled(args, 'block_loss_expert', 'block_update_expert'))}), "
-                f"expert_loss(attn={bool(getattr(args, 'expert_loss_attn', False))}, experts=True), top_n={top_n}"
+                f"expert_loss(attn={bool(getattr(args, 'expert_loss_attn', False))}, experts={bool(getattr(args, 'expert_loss_expert', False))}), top_n={top_n}"
             )
             logger.info(
                 f"[Decoupled Joint] Layer {layer_idx}: selected params block={len(block_selected_params)} "

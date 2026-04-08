@@ -624,6 +624,7 @@ def test_build_block_update_param_groups_respects_scope_flags():
         block_loss_attn=False,
         block_loss_router=False,
         block_loss_expert=False,
+        expert_loss_expert=False,
     )
 
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)

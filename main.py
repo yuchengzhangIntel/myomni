@@ -472,18 +472,16 @@ def main():
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
     parser.add_argument("--block_eval_interval", type=int, default=0,
                         help="Run student-only block-wise evaluation every N MoE epochs; disabled when < 1")
-    parser.add_argument("--block_loss_attn", default=True, action="store_true",
-                        help="Allow in-step block-wise loss to update attention LWC/LoRA parameters (default: ON)")
-    parser.add_argument("--disable_block_loss_attn", dest="block_loss_attn", action="store_false",
-                        help="Disable in-step block-wise loss updates for attention LWC/LoRA parameters")
-    parser.add_argument("--block_loss_router", default=True, action="store_true",
-                        help="Allow in-step block-wise loss to update router and shared-gate parameters (default: ON)")
-    parser.add_argument("--disable_block_loss_router", dest="block_loss_router", action="store_false",
-                        help="Disable in-step block-wise loss updates for router and shared-gate parameters")
+    parser.add_argument("--block_loss_attn", default=False, action="store_true",
+                        help="Allow in-step block-wise loss to update attention LWC/LoRA parameters")
+    parser.add_argument("--block_loss_router", default=False, action="store_true",
+                        help="Allow in-step block-wise loss to update router and shared-gate parameters")
     parser.add_argument("--block_loss_expert", default=False, action="store_true",
                         help="Allow in-step block-wise loss to update routed/shared expert parameters")
     parser.add_argument("--expert_loss_attn", default=False, action="store_true",
                         help="Allow dynamic expert self-supervision loss to update attention LWC/LoRA parameters")
+    parser.add_argument("--expert_loss_expert", default=False, action="store_true",
+                        help="Allow dynamic expert self-supervision loss to update routed/shared expert parameters")
     parser.add_argument("--joint_moe_debug", default=False, action="store_true",
                         help="Enable verbose debug logging for the Qwen/DeepSeek joint MoE training path")
     parser.add_argument("--enable_block_loss_update", dest="enable_block_loss_update", default=False, action="store_true",
@@ -546,13 +544,14 @@ def main():
             args.block_loss_router,
             args.block_loss_expert,
             args.expert_loss_attn,
+            args.expert_loss_expert,
         ])
         if not has_any_trainable_mechanism:
             raise ValueError(
                 "Training epochs are set, but no trainable mechanism is enabled. "
                 "Enable at least one of --lwc, --let, --use_linear_lora, --train_gate_lora, "
                 "--train_shared_gate, --block_loss_attn, --block_loss_router, --block_loss_expert, "
-                "--expert_loss_attn, or --calibrate_router."
+                "--expert_loss_attn, --expert_loss_expert, or --calibrate_router."
             )
 
     if args.use_linear_lora and args.let:
@@ -614,6 +613,7 @@ def main():
     logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
     logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
     logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
+    logger.info(f"  Expert Loss Experts       : {'ON' if args.expert_loss_expert else 'OFF'}")
     logger.info(f"  Joint MoE Debug Logs      : {'ON' if args.joint_moe_debug else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
@@ -784,6 +784,7 @@ def main():
     logger.info(f"  Block Loss Router/Gates   : {'ON' if args.block_loss_router else 'OFF'}")
     logger.info(f"  Block Loss Experts        : {'ON' if args.block_loss_expert else 'OFF'}")
     logger.info(f"  Expert Loss Attention     : {'ON' if args.expert_loss_attn else 'OFF'}")
+    logger.info(f"  Expert Loss Experts       : {'ON' if args.expert_loss_expert else 'OFF'}")
     logger.info(f"  Joint MoE Debug Logs      : {'ON' if args.joint_moe_debug else 'OFF'}")
     logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
