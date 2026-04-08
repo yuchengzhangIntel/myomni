@@ -829,10 +829,11 @@ def train_decoupled_moe_layer(
 
     eval_interval = getattr(args, "block_eval_interval", 0)
     periodic_eval_enabled = eval_interval >= 1
-    top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
     block_selected_params, block_param_groups = build_block_loss_param_groups(qlayer, args)
     expert_selected_params, expert_param_groups = build_expert_self_supervision_param_groups(qlayer, args)
     joint_selected_params, joint_param_groups = merge_param_groups(block_param_groups, expert_param_groups)
+    expert_loss_enabled = bool(expert_selected_params)
+    top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n) if expert_loss_enabled else None
     original_requires_grad = {id(param): param.requires_grad for param in qlayer.parameters()}
 
     if joint_selected_params:
@@ -850,7 +851,8 @@ def train_decoupled_moe_layer(
                 f"block_loss(attn={bool(block_selected_params and _scope_enabled(args, 'block_loss_attn', 'block_update_attn'))}, "
                 f"router={bool(block_selected_params and _scope_enabled(args, 'block_loss_router', 'block_update_router'))}, "
                 f"experts={bool(block_selected_params and _scope_enabled(args, 'block_loss_expert', 'block_update_expert'))}), "
-                f"expert_loss(attn={bool(getattr(args, 'expert_loss_attn', False))}, experts={bool(getattr(args, 'expert_loss_expert', False))}), top_n={top_n}"
+                f"expert_loss(enabled={expert_loss_enabled}, attn={bool(getattr(args, 'expert_loss_attn', False))}, "
+                f"experts={bool(getattr(args, 'expert_loss_expert', False))}), top_n={top_n if top_n is not None else 'OFF'}"
             )
             logger.info(
                 f"[Decoupled Joint] Layer {layer_idx}: selected params block={len(block_selected_params)} "
@@ -895,52 +897,55 @@ def train_decoupled_moe_layer(
 
                         if student_mlp_inputs is None:
                             raise RuntimeError(f"Layer {layer_idx}: failed to capture MLP inputs during student forward")
-                        if router_scores is None:
+                        if expert_loss_enabled and router_scores is None:
                             raise RuntimeError(f"Layer {layer_idx}: failed to capture router scores during student forward")
 
-                        flat_router_scores = router_scores.reshape(-1, router_scores.shape[-1])
-                        top_indices, top_weights = select_top_n_experts(flat_router_scores, top_n)
-                        batch_size = student_mlp_inputs.shape[0]
-                        seq_len = student_mlp_inputs.shape[1]
-                        top_indices = top_indices.reshape(batch_size, seq_len, -1)
-                        top_weights = top_weights.reshape(batch_size, seq_len, -1)
+                        if expert_loss_enabled:
+                            flat_router_scores = router_scores.reshape(-1, router_scores.shape[-1])
+                            top_indices, top_weights = select_top_n_experts(flat_router_scores, top_n)
+                            batch_size = student_mlp_inputs.shape[0]
+                            seq_len = student_mlp_inputs.shape[1]
+                            top_indices = top_indices.reshape(batch_size, seq_len, -1)
+                            top_weights = top_weights.reshape(batch_size, seq_len, -1)
 
-                        teacher_label_cache = build_dynamic_moe_label_cache(
-                            layer,
-                            fp_mlp_inputs[start:end],
-                            top_indices,
-                            top_weights,
-                            use_router_weight_in_loss,
-                        )
-
-                        if start == 0 and getattr(args, "joint_moe_debug", False):
-                            active_experts = sorted({
-                                expert_idx
-                                for sample_cache in teacher_label_cache
-                                for expert_idx in sample_cache["expert_labels"].keys()
-                            })
-                            router_stats = flat_router_scores.detach().float()
-                            logger.info(
-                                f"[Decoupled Joint][Debug] Layer {layer_idx} epoch {epoch}: "
-                                f"fp_mlp_inputs={tuple(fp_mlp_inputs[start:end].shape)} "
-                                f"student_mlp_inputs={tuple(student_mlp_inputs.shape)} "
-                                f"router_scores={tuple(router_scores.shape)} "
-                                f"active_experts={active_experts[:16]}"
-                                + ("..." if len(active_experts) > 16 else "")
-                                + f" router_score_range=({router_stats.min().item():.6g}, {router_stats.max().item():.6g})"
+                            teacher_label_cache = build_dynamic_moe_label_cache(
+                                layer,
+                                fp_mlp_inputs[start:end],
+                                top_indices,
+                                top_weights,
+                                use_router_weight_in_loss,
                             )
 
-                        expert_loss_inputs = student_mlp_inputs if getattr(args, "expert_loss_attn", False) else student_mlp_inputs.detach()
-                        expert_loss = compute_moe_self_supervision_loss(
-                            qlayer,
-                            quant_inputs=None,
-                            batch_label_cache=teacher_label_cache,
-                            layer_kwargs={},
-                            attention_mask=None,
-                            position_ids=None,
-                            use_router_weight_in_loss=use_router_weight_in_loss,
-                            precomputed_mlp_inputs=expert_loss_inputs,
-                        )
+                            if start == 0 and getattr(args, "joint_moe_debug", False):
+                                active_experts = sorted({
+                                    expert_idx
+                                    for sample_cache in teacher_label_cache
+                                    for expert_idx in sample_cache["expert_labels"].keys()
+                                })
+                                router_stats = flat_router_scores.detach().float()
+                                logger.info(
+                                    f"[Decoupled Joint][Debug] Layer {layer_idx} epoch {epoch}: "
+                                    f"fp_mlp_inputs={tuple(fp_mlp_inputs[start:end].shape)} "
+                                    f"student_mlp_inputs={tuple(student_mlp_inputs.shape)} "
+                                    f"router_scores={tuple(router_scores.shape)} "
+                                    f"active_experts={active_experts[:16]}"
+                                    + ("..." if len(active_experts) > 16 else "")
+                                    + f" router_score_range=({router_stats.min().item():.6g}, {router_stats.max().item():.6g})"
+                                )
+
+                            expert_loss_inputs = student_mlp_inputs if getattr(args, "expert_loss_attn", False) else student_mlp_inputs.detach()
+                            expert_loss = compute_moe_self_supervision_loss(
+                                qlayer,
+                                quant_inputs=None,
+                                batch_label_cache=teacher_label_cache,
+                                layer_kwargs={},
+                                attention_mask=None,
+                                position_ids=None,
+                                use_router_weight_in_loss=use_router_weight_in_loss,
+                                precomputed_mlp_inputs=expert_loss_inputs,
+                            )
+                        else:
+                            expert_loss = torch.zeros_like(block_loss)
                         total_loss = block_loss + expert_loss
 
                     if not torch.isfinite(total_loss.detach()):
