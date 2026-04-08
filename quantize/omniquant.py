@@ -337,6 +337,94 @@ def merge_param_groups(*param_group_lists):
     return merged_params, merged_groups
 
 
+def _normalize_parameter_scope_name(parameter_name):
+    quantizer_markers = (
+        ".weight_quantizer.",
+        ".act_quantizer.",
+    )
+    for marker in quantizer_markers:
+        if marker in parameter_name:
+            return parameter_name.split(marker, 1)[0]
+
+    suffixes = (
+        ".lora_A",
+        ".lora_B",
+        ".bound_factor",
+        ".lowbound_factor",
+        ".upbound_factor",
+        ".weight",
+        ".bias",
+    )
+    for suffix in suffixes:
+        if parameter_name.endswith(suffix):
+            return parameter_name[: -len(suffix)]
+
+    return parameter_name
+
+
+def _format_scope_preview(scope_names, preview_limit=8):
+    if not scope_names:
+        return "[]"
+    preview_items = scope_names[:preview_limit]
+    preview_text = ", ".join(preview_items)
+    if len(scope_names) > preview_limit:
+        preview_text += ", ..."
+    return f"[{preview_text}]"
+
+
+def summarize_parameter_scopes(module, parameters):
+    parameter_name_by_id = {id(param): name for name, param in module.named_parameters()}
+    category_scopes = {
+        "attention": [],
+        "router": [],
+        "shared_gate": [],
+        "routed_experts": [],
+        "shared_expert": [],
+        "other": [],
+    }
+
+    seen_scope_names = set()
+    for param in dedupe_parameters(parameters):
+        parameter_name = parameter_name_by_id.get(id(param))
+        if parameter_name is None:
+            continue
+        scope_name = _normalize_parameter_scope_name(parameter_name)
+        if scope_name in seen_scope_names:
+            continue
+        seen_scope_names.add(scope_name)
+
+        if scope_name.startswith("self_attn."):
+            category_scopes["attention"].append(scope_name)
+        elif scope_name == "mlp.gate":
+            category_scopes["router"].append(scope_name)
+        elif scope_name == "mlp.shared_expert_gate":
+            category_scopes["shared_gate"].append(scope_name)
+        elif scope_name.startswith("mlp.experts."):
+            category_scopes["routed_experts"].append(scope_name)
+        elif scope_name.startswith("mlp.shared_expert") or scope_name.startswith("mlp.shared_experts"):
+            category_scopes["shared_expert"].append(scope_name)
+        else:
+            category_scopes["other"].append(scope_name)
+
+    for scope_names in category_scopes.values():
+        scope_names.sort()
+    return category_scopes
+
+
+def format_parameter_scope_summary(module, parameters, loss_name):
+    category_scopes = summarize_parameter_scopes(module, parameters)
+    summary_parts = [
+        f"attention({len(category_scopes['attention'])})={_format_scope_preview(category_scopes['attention'])}",
+        f"router({len(category_scopes['router'])})={_format_scope_preview(category_scopes['router'])}",
+        f"shared_gate({len(category_scopes['shared_gate'])})={_format_scope_preview(category_scopes['shared_gate'])}",
+        f"routed_experts({len(category_scopes['routed_experts'])})={_format_scope_preview(category_scopes['routed_experts'])}",
+        f"shared_expert({len(category_scopes['shared_expert'])})={_format_scope_preview(category_scopes['shared_expert'])}",
+    ]
+    if category_scopes["other"]:
+        summary_parts.append(f"other({len(category_scopes['other'])})={_format_scope_preview(category_scopes['other'])}")
+    return f"[{loss_name}] " + " ".join(summary_parts)
+
+
 def compute_attention_outputs(layer, hidden_states, layer_kwargs, attention_mask=None, position_ids=None):
     normed_hidden_states = layer.input_layernorm(hidden_states)
     return extract_hidden_states(call_layer_forward(
@@ -764,6 +852,14 @@ def train_decoupled_moe_layer(
         logger.info(
             f"[Decoupled Joint] Layer {layer_idx}: selected params block={len(block_selected_params)} "
             f"expert={len(expert_selected_params)} merged={len(joint_selected_params)}"
+        )
+        logger.info(
+            f"[Decoupled Joint] Layer {layer_idx}: "
+            + format_parameter_scope_summary(qlayer, block_selected_params, "loss1_block")
+        )
+        logger.info(
+            f"[Decoupled Joint] Layer {layer_idx}: "
+            + format_parameter_scope_summary(qlayer, expert_selected_params, "loss2_expert")
         )
         joint_optimizer = torch.optim.AdamW(joint_param_groups, weight_decay=0)
         grad_scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
