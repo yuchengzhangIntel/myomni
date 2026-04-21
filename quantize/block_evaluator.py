@@ -107,14 +107,32 @@ def _align_router_logits_for_teacher(router_logits: torch.Tensor, teacher_indice
     if router_logits is None:
         return None
 
+    if teacher_indices is None or teacher_indices.dim() != 3:
+        if logger is not None:
+            logger.warning(
+                "[BlockUpdate] Teacher router indices are unavailable or not 3D; skip auxiliary router loss"
+            )
+        return None
+
     if router_logits.dim() == 3:
+        if router_logits.shape[:2] != teacher_indices.shape[:2]:
+            if logger is not None:
+                logger.warning(
+                    "[BlockUpdate] Router logits shape mismatch: student=%s teacher=%s; skip auxiliary router loss",
+                    tuple(router_logits.shape),
+                    tuple(teacher_indices.shape),
+                )
+            return None
         return router_logits
 
     if router_logits.dim() != 2:
-        return router_logits
-
-    if teacher_indices is None or teacher_indices.dim() != 3:
-        return router_logits.unsqueeze(0)
+        if logger is not None:
+            logger.warning(
+                "[BlockUpdate] Unsupported router logits rank %s with shape=%s; skip auxiliary router loss",
+                router_logits.dim(),
+                tuple(router_logits.shape),
+            )
+        return None
 
     batch_size, seq_len, _ = teacher_indices.shape
     flat_tokens, num_experts = router_logits.shape
@@ -124,11 +142,11 @@ def _align_router_logits_for_teacher(router_logits: torch.Tensor, teacher_indice
 
     if logger is not None:
         logger.warning(
-            "[BlockUpdate] Router logits shape mismatch: student=%s teacher=%s; fallback to unsqueeze(0)",
+            "[BlockUpdate] Router logits shape mismatch: student=%s teacher=%s; skip auxiliary router loss",
             tuple(router_logits.shape),
             tuple(teacher_indices.shape),
         )
-    return router_logits.unsqueeze(0)
+    return None
 
 
 def evaluate_block_loss_modes(
@@ -244,6 +262,7 @@ def update_block_parameters_with_loss(
         skipped_aux_missing_teacher = 0
         skipped_aux_missing_router = 0
         skipped_aux_missing_alignment = 0
+        skipped_aux_invalid_loss = 0
 
         for start, end in _iter_batch_indices(args.nsamples, args.batch_size):
             batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
@@ -277,7 +296,16 @@ def update_block_parameters_with_loss(
                             if aligned_router_logits is None:
                                 skipped_aux_missing_alignment += 1
                             else:
-                                aux_loss = compute_topk_mse_loss(aligned_router_logits.float(), teacher_logits, teacher_indices)
+                                aux_loss_value = compute_topk_mse_loss(
+                                    aligned_router_logits.float(),
+                                    teacher_logits,
+                                    teacher_indices,
+                                    return_none_on_nonfinite=True,
+                                )
+                                if aux_loss_value is None:
+                                    skipped_aux_invalid_loss += 1
+                                else:
+                                    aux_loss = aux_loss_value
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
 
@@ -318,12 +346,13 @@ def update_block_parameters_with_loss(
             f"aux_loss:{_fmt_metric(aux_mean)} total_loss:{_fmt_metric(total_mean)} norm:{_fmt_metric(norm_mean)}"
         )
 
-        if aux_enabled and (skipped_aux_missing_teacher or skipped_aux_missing_router or skipped_aux_missing_alignment):
+        if aux_enabled and (skipped_aux_missing_teacher or skipped_aux_missing_router or skipped_aux_missing_alignment or skipped_aux_invalid_loss):
             logger.warning(
                 f"[BlockUpdate] layer {layer_idx} epoch {update_epoch} auxiliary router loss skipped "
                 f"for teacher_missing={skipped_aux_missing_teacher} batches, "
                 f"router_missing={skipped_aux_missing_router} batches, "
-                f"alignment_missing={skipped_aux_missing_alignment} batches"
+                f"alignment_missing={skipped_aux_missing_alignment} batches, "
+                f"invalid_loss={skipped_aux_invalid_loss} batches"
             )
 
     return final_total

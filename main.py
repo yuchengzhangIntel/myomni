@@ -74,7 +74,7 @@ net_choices = [
     "mixtral-8x7b",
     "deepseek-moe-16b-base",
     "Qwen1.5-MoE-A2.7B",
-    "Qwen3-30B-A3B-Base"
+    "Qwen3-30B-A3B"
 ]
 
 
@@ -457,13 +457,19 @@ def main():
     
     # Router Calibration arguments (for Qwen MoE models)
     parser.add_argument("--calibrate_router", default=False, action="store_true",
-                        help="Enable Router Calibration using TopK-MSE loss for Qwen MoE models")
+                        help="Enable the legacy Router Calibration path using TopK-MSE loss (non-decoupled Qwen MoE flow)")
     parser.add_argument("--router_lr", type=float, default=1e-2,
                         help="Learning rate for router calibration (default 1e-2, higher than LWC)")
     parser.add_argument("--router_epochs", type=int, default=5,
                         help="Number of epochs for router calibration per layer")
+    parser.add_argument("--enable_expert_shift_calibration", default=False, action="store_true",
+                        help="Enable the decoupled stage2 expert-shift calibration phase before block-wise free routing")
+    parser.add_argument("--expert_shift_calibration_update_attn", default=False, action="store_true",
+                        help="Allow stage2 expert-shift calibration to update attention LWC/Linear-LoRA parameters")
+    parser.add_argument("--expert_shift_calibration_use_kl", default=False, action="store_true",
+                        help="Use teacher-top-k KL divergence instead of TopK-MSE during stage2 expert-shift calibration")
     parser.add_argument("--k_loss", type=int, default=20,
-                        help="TopK for loss calculation (number of experts to cache for TopK-MSE)")
+                        help="TopK used by router calibration losses and expert-shift label caching")
     parser.add_argument("--k_routing", type=int, default=4,
                         help="TopK for expert shift metric (actual routing k used in the model)")
     parser.add_argument("--quant_routing_top_n", type=int, default=None,
@@ -504,6 +510,8 @@ def main():
         raise ValueError("--block_aux_loss_weight must be non-negative")
     if args.max_train_layers < -1:
         raise ValueError("--max_train_layers must be -1 or a non-negative integer")
+    if args.enable_expert_shift_calibration and args.router_epochs <= 0:
+        raise ValueError("--router_epochs must be positive when --enable_expert_shift_calibration is enabled")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -511,6 +519,8 @@ def main():
 
     # check
     if getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0:
+        has_any_trainable_mechanism = True
+    elif getattr(args, "enable_expert_shift_calibration", False) and getattr(args, "router_epochs", 0) > 0:
         has_any_trainable_mechanism = True
     elif args.epochs > 0 or args.attn_epochs > 0:
         has_any_trainable_mechanism = any([
@@ -521,12 +531,13 @@ def main():
             args.train_shared_gate,
             args.enable_block_loss_update,
             args.calibrate_router,
+            args.enable_expert_shift_calibration,
         ])
         if not has_any_trainable_mechanism:
             raise ValueError(
                 "Training epochs are set, but no trainable mechanism is enabled. "
                 "Enable at least one of --lwc, --let, --use_linear_lora, --train_gate_lora, "
-                "--train_shared_gate, --enable_block_loss_update, or --calibrate_router."
+                "--train_shared_gate, --enable_block_loss_update, --enable_expert_shift_calibration, or --calibrate_router."
             )
 
     if args.use_linear_lora and args.let:
@@ -538,6 +549,12 @@ def main():
     if args.use_linear_lora and args.linear_lora_r <= 0:
         raise ValueError("--linear_lora_r must be positive when --use_linear_lora is enabled")
 
+    if args.expert_shift_calibration_update_attn and not args.enable_expert_shift_calibration:
+        raise ValueError("--expert_shift_calibration_update_attn requires --enable_expert_shift_calibration")
+
+    if args.expert_shift_calibration_use_kl and not args.enable_expert_shift_calibration:
+        raise ValueError("--expert_shift_calibration_use_kl requires --enable_expert_shift_calibration")
+
     effective_net_name = (args.net or args.model.split('/')[-1]).lower()
     if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.let:
         raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --let")
@@ -547,6 +564,8 @@ def main():
         raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_shared_gate without an explicit shared-gate loss")
     if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.calibrate_router:
         raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --calibrate_router")
+    if args.enable_expert_shift_calibration and not ("qwen" in effective_net_name or "deepseek" in effective_net_name):
+        raise ValueError("--enable_expert_shift_calibration is currently only supported for decoupled Qwen/DeepSeek MoE models")
 
     if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16 and args.abits >= 8):
         args.deactive_amp = True
@@ -570,6 +589,9 @@ def main():
     logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
+    logger.info(f"  Expert Shift Calibration  : {'ON' if args.enable_expert_shift_calibration else 'OFF'}"
+                + (f"  (router_lr={args.router_lr}, router_epochs={args.router_epochs}, loss={'KL' if args.expert_shift_calibration_use_kl else 'MSE'})" if args.enable_expert_shift_calibration else ""))
+    logger.info(f"  Stage2 Update Attention   : {'ON' if args.expert_shift_calibration_update_attn else 'OFF'}")
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
     logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"
@@ -742,6 +764,9 @@ def main():
     logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
+    logger.info(f"  Expert Shift Calibration  : {'ON' if args.enable_expert_shift_calibration else 'OFF'}"
+                + (f"  (router_lr={args.router_lr}, router_epochs={args.router_epochs}, loss={'KL' if args.expert_shift_calibration_use_kl else 'MSE'})" if args.enable_expert_shift_calibration else ""))
+    logger.info(f"  Stage2 Update Attention   : {'ON' if args.expert_shift_calibration_update_attn else 'OFF'}")
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
     logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"

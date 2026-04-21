@@ -281,7 +281,50 @@ def create_router_hook():
 # =============================================================================
 # Router Calibration Loss Functions
 # =============================================================================
-def compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices, debug=False):
+def _prepare_topk_router_loss_inputs(student_logits, teacher_logits, teacher_indices):
+    student_logits_f32 = student_logits.float()
+    teacher_indices = teacher_indices.to(device=student_logits.device, dtype=torch.long)
+    teacher_logits_f32 = teacher_logits.to(device=student_logits.device).float()
+
+    if student_logits_f32.dim() != 3 or teacher_logits_f32.dim() != 3 or teacher_indices.dim() != 3:
+        raise ValueError(
+            f"expected 3D tensors, got student={tuple(student_logits_f32.shape)} teacher_logits={tuple(teacher_logits_f32.shape)} teacher_indices={tuple(teacher_indices.shape)}"
+        )
+
+    if teacher_logits_f32.shape != teacher_indices.shape:
+        raise ValueError(
+            f"teacher logits and indices must share the same shape, got logits={tuple(teacher_logits_f32.shape)} indices={tuple(teacher_indices.shape)}"
+        )
+
+    if student_logits_f32.shape[:2] != teacher_indices.shape[:2]:
+        raise ValueError(
+            f"student and teacher leading dims must match, got student={tuple(student_logits_f32.shape)} teacher_indices={tuple(teacher_indices.shape)}"
+        )
+
+    if teacher_indices.shape[-1] > student_logits_f32.shape[-1]:
+        raise ValueError(
+            f"teacher top-k ({teacher_indices.shape[-1]}) exceeds student num_experts ({student_logits_f32.shape[-1]})"
+        )
+
+    if teacher_indices.numel() > 0:
+        min_index = int(teacher_indices.min().item())
+        max_index = int(teacher_indices.max().item())
+        if min_index < 0 or max_index >= student_logits_f32.shape[-1]:
+            raise ValueError(
+                f"teacher indices out of bounds for student logits: min={min_index}, max={max_index}, num_experts={student_logits_f32.shape[-1]}"
+            )
+
+    gathered_student_logits = torch.gather(student_logits_f32, dim=-1, index=teacher_indices)
+    return student_logits_f32, teacher_logits_f32, teacher_indices, gathered_student_logits
+
+
+def compute_topk_mse_loss(
+    student_logits,
+    teacher_logits,
+    teacher_indices,
+    debug=False,
+    return_none_on_nonfinite=False,
+):
     """
     Compute TopK-MSE loss for router calibration using raw logits (no softmax).
     
@@ -294,15 +337,17 @@ def compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices, debug
     Returns:
         loss: MSE loss between gathered student logits and teacher logits at top-k positions
     """
-    # Use float32 for numerical stability
-    student_logits_f32 = student_logits.float()
-    
-    # Ensure teacher tensors are on same device and use float32
-    teacher_indices = teacher_indices.to(student_logits.device)
-    teacher_logits_f32 = teacher_logits.to(device=student_logits.device).float()
-    
-    # Gather student raw logits at teacher's top-k indices
-    gathered_student_logits = torch.gather(student_logits_f32, dim=-1, index=teacher_indices)
+    try:
+        student_logits_f32, teacher_logits_f32, teacher_indices, gathered_student_logits = _prepare_topk_router_loss_inputs(
+            student_logits,
+            teacher_logits,
+            teacher_indices,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"[WARNING] Invalid input in compute_topk_mse_loss: {exc}")
+        if return_none_on_nonfinite:
+            return None
+        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
     
     if debug:
         print(f"[DEBUG] compute_topk_mse_loss (raw logits):")
@@ -313,15 +358,74 @@ def compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices, debug
         print(f"  Any NaN in teacher_logits: {torch.isnan(teacher_logits_f32).any().item()}")
     
     # Check for NaN and handle gracefully
-    if torch.isnan(student_logits_f32).any() or torch.isnan(teacher_logits_f32).any():
-        print(f"[WARNING] NaN detected in compute_topk_mse_loss!")
-        # Return zero loss to avoid corrupting gradients
+    if (
+        not torch.isfinite(student_logits_f32).all()
+        or not torch.isfinite(teacher_logits_f32).all()
+        or not torch.isfinite(gathered_student_logits).all()
+    ):
+        print(f"[WARNING] Non-finite value detected in compute_topk_mse_loss!")
+        if return_none_on_nonfinite:
+            return None
         return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
     
     # Compute MSE loss on raw logits in float32
     loss = F.mse_loss(gathered_student_logits, teacher_logits_f32)
     
     return loss
+
+
+def compute_topk_kl_loss(
+    student_logits,
+    teacher_logits,
+    teacher_indices,
+    debug=False,
+    return_none_on_nonfinite=False,
+):
+    """
+    Compute KL divergence on the teacher top-k subset after renormalizing both
+    teacher and student on that subset.
+    """
+    try:
+        student_logits_f32, teacher_logits_f32, _teacher_indices, gathered_student_logits = _prepare_topk_router_loss_inputs(
+            student_logits,
+            teacher_logits,
+            teacher_indices,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"[WARNING] Invalid input in compute_topk_kl_loss: {exc}")
+        if return_none_on_nonfinite:
+            return None
+        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+
+    if debug:
+        print(f"[DEBUG] compute_topk_kl_loss (teacher top-k subset):")
+        print(f"  student_logits: min={student_logits_f32.min().item():.4f}, max={student_logits_f32.max().item():.4f}")
+        print(f"  gathered_student_logits: min={gathered_student_logits.min().item():.6f}, max={gathered_student_logits.max().item():.6f}")
+        print(f"  teacher_logits: min={teacher_logits_f32.min().item():.6f}, max={teacher_logits_f32.max().item():.6f}")
+        print(f"  Any non-finite in student logits: {(~torch.isfinite(student_logits_f32)).any().item()}")
+        print(f"  Any non-finite in teacher logits: {(~torch.isfinite(teacher_logits_f32)).any().item()}")
+
+    if (
+        not torch.isfinite(student_logits_f32).all()
+        or not torch.isfinite(teacher_logits_f32).all()
+        or not torch.isfinite(gathered_student_logits).all()
+    ):
+        print(f"[WARNING] Non-finite value detected in compute_topk_kl_loss!")
+        if return_none_on_nonfinite:
+            return None
+        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+
+    teacher_probs = F.softmax(teacher_logits_f32, dim=-1)
+    student_log_probs = F.log_softmax(gathered_student_logits, dim=-1)
+    if not torch.isfinite(teacher_probs).all() or not torch.isfinite(student_log_probs).all():
+        print(f"[WARNING] Non-finite probability detected in compute_topk_kl_loss!")
+        if return_none_on_nonfinite:
+            return None
+        return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+
+    flat_student_log_probs = student_log_probs.reshape(-1, student_log_probs.shape[-1])
+    flat_teacher_probs = teacher_probs.reshape(-1, teacher_probs.shape[-1])
+    return F.kl_div(flat_student_log_probs, flat_teacher_probs, reduction="batchmean")
 
 
 def let_parameters(model, use_shift=True):

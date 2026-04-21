@@ -33,35 +33,86 @@ class NativeScalerWithGradNormCount:
         self._max_grad_norm_for_update = max_grad_norm_for_update
         self._scaler = torch.amp.GradScaler('cuda') if self._use_grad_scaler else None
 
-    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True,retain_graph=False):
-        if self._use_grad_scaler:
-            # Keep FP16 behavior identical to the original implementation.
-            self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
-            if update_grad:
-                if clip_grad is not None:
-                    assert parameters is not None
-                    self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                    norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
-                else:
-                    self._scaler.unscale_(optimizer)
-                    norm = ampscaler_get_grad_norm(parameters)
-                self._scaler.step(optimizer)
-                self._scaler.update()
-            else:
-                norm = None
-            return norm
-
-        # BF16 / no-GradScaler path: keep clipping and skip bad updates.
-        if not torch.isfinite(loss.detach()):
-            optimizer.zero_grad(set_to_none=True)
-            return torch.tensor(0.0, device=loss.device)
-
+    def __call__(
+        self,
+        loss,
+        optimizer,
+        clip_grad=None,
+        parameters=None,
+        create_graph=False,
+        update_grad=True,
+        retain_graph=False,
+        return_metadata=False,
+    ):
         if isinstance(parameters, torch.Tensor):
             param_list = [parameters]
         elif parameters is None:
             param_list = []
         else:
             param_list = list(parameters)
+
+        skipped_update = False
+        skip_reason = None
+
+        if self._use_grad_scaler:
+            if not torch.isfinite(loss.detach()):
+                optimizer.zero_grad(set_to_none=True)
+                norm = torch.tensor(0.0, device=loss.device)
+                skipped_update = True
+                skip_reason = "nonfinite_loss"
+                if return_metadata:
+                    return norm, skipped_update, skip_reason
+                return norm
+
+            self._scaler.scale(loss).backward(create_graph=create_graph, retain_graph=retain_graph)
+            if update_grad:
+                if clip_grad is not None:
+                    assert param_list
+                    self._scaler.unscale_(optimizer)
+                    norm = torch.nn.utils.clip_grad_norm_(param_list, clip_grad)
+                else:
+                    self._scaler.unscale_(optimizer)
+                    norm = ampscaler_get_grad_norm(param_list)
+
+                if norm is None:
+                    norm = torch.tensor(0.0, device=loss.device)
+
+                norm_value = float(norm.detach().item()) if isinstance(norm, torch.Tensor) else float(norm)
+                is_nonfinite = not math.isfinite(norm_value)
+                is_too_large = (
+                    self._max_grad_norm_for_update is not None
+                    and norm_value > float(self._max_grad_norm_for_update)
+                )
+
+                if is_nonfinite:
+                    self._scaler.step(optimizer)
+                    self._scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    skipped_update = True
+                    skip_reason = "nonfinite_grad_norm"
+                elif is_too_large:
+                    optimizer.zero_grad(set_to_none=True)
+                    skipped_update = True
+                    skip_reason = "grad_norm_too_large"
+                else:
+                    self._scaler.step(optimizer)
+                    self._scaler.update()
+            else:
+                norm = None
+
+            if return_metadata:
+                return norm, skipped_update, skip_reason
+            return norm
+
+        # BF16 / no-GradScaler path: keep clipping and skip bad updates.
+        if not torch.isfinite(loss.detach()):
+            optimizer.zero_grad(set_to_none=True)
+            norm = torch.tensor(0.0, device=loss.device)
+            skipped_update = True
+            skip_reason = "nonfinite_loss"
+            if return_metadata:
+                return norm, skipped_update, skip_reason
+            return norm
 
         loss.backward(create_graph=create_graph, retain_graph=retain_graph)
 
@@ -84,11 +135,19 @@ class NativeScalerWithGradNormCount:
 
             if is_nonfinite or is_too_large:
                 optimizer.zero_grad(set_to_none=True)
-                return torch.tensor(0.0, device=loss.device)
+                skipped_update = True
+                skip_reason = "nonfinite_grad_norm" if is_nonfinite else "grad_norm_too_large"
+                norm = torch.tensor(0.0, device=loss.device)
+                if return_metadata:
+                    return norm, skipped_update, skip_reason
+                return norm
 
             optimizer.step()
         else:
             norm = None
+
+        if return_metadata:
+            return norm, skipped_update, skip_reason
         return norm
 
     def state_dict(self):

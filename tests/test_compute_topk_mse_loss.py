@@ -16,7 +16,7 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quantize.utils import compute_topk_mse_loss
+from quantize.utils import compute_topk_kl_loss, compute_topk_mse_loss
 
 
 class TestComputeTopkMseLoss:
@@ -213,6 +213,28 @@ class TestComputeTopkMseLoss:
         teacher_indices_int64 = torch.randint(0, num_experts, (batch_size, seq_len, topk), dtype=torch.int64)
         loss_int64 = compute_topk_mse_loss(student_logits, teacher_logits, teacher_indices_int64)
         assert not torch.isnan(loss_int64), "Loss should work with int64 indices"
+
+    def test_shape_mismatch_returns_none_when_requested(self):
+        """Invalid leading dims should return None instead of raising when requested."""
+        student_logits = torch.randn(1, 10, 16)
+        teacher_logits = torch.randn(2, 5, 4)
+        teacher_indices = torch.randint(0, 16, (2, 5, 4))
+
+        mse_loss = compute_topk_mse_loss(
+            student_logits,
+            teacher_logits,
+            teacher_indices,
+            return_none_on_nonfinite=True,
+        )
+        kl_loss = compute_topk_kl_loss(
+            student_logits,
+            teacher_logits,
+            teacher_indices,
+            return_none_on_nonfinite=True,
+        )
+
+        assert mse_loss is None, "MSE loss should return None on invalid leading dims when requested"
+        assert kl_loss is None, "KL loss should return None on invalid leading dims when requested"
 
 
 def run_tests():
