@@ -497,25 +497,26 @@ def train_decoupled_moe_layer(
     teacher_label_topk = max(routing_top_k, getattr(args, "k_loss", routing_top_k))
     if max_experts is not None:
         teacher_label_topk = min(teacher_label_topk, int(max_experts))
-    teacher_router_labels = capture_teacher_router_labels(
-        layer,
-        fp_inps,
-        quant_inps.device,
-        layer_kwargs,
-        topk=teacher_label_topk,
-        logger=logger,
-    )
-    if teacher_router_labels is None:
-        logger.warning(
-            f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, auxiliary router loss will be skipped"
-        )
-
     eval_interval = getattr(args, "block_eval_interval", 0)
     periodic_eval_enabled = eval_interval >= 1
     update_stage_enabled = getattr(args, "enable_block_loss_update", False)
     update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
     block_aux_enabled = getattr(args, "block_aux_loss", False)
     block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
+    teacher_router_labels = None
+    if block_aux_enabled:
+        teacher_router_labels = capture_teacher_router_labels(
+            layer,
+            fp_inps,
+            quant_inps.device,
+            layer_kwargs,
+            topk=teacher_label_topk,
+            logger=logger,
+        )
+        if teacher_router_labels is None:
+            logger.warning(
+                f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, auxiliary router loss will be skipped"
+            )
     if block_aux_enabled and teacher_router_labels is None:
         logger.warning(f"[BlockUpdate] Layer {layer_idx}: block auxiliary router loss requested but teacher labels are unavailable")
 
@@ -720,6 +721,7 @@ def train_decoupled_moe_layer(
             smooth_is_llama=True,
         )
 
+    del teacher_router_labels
     del label_cache
     return final_stage_loss
 
