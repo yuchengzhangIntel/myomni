@@ -259,6 +259,7 @@ def update_block_parameters_with_loss(
         aug_items = []
         aux_items = []
         norm_items = []
+        skipped_batches = 0
         skipped_aux_missing_teacher = 0
         skipped_aux_missing_router = 0
         skipped_aux_missing_alignment = 0
@@ -267,6 +268,9 @@ def update_block_parameters_with_loss(
         for start, end in _iter_batch_indices(args.nsamples, args.batch_size):
             batch_attention_mask = _get_batch_attention_mask(attention_mask_batch, start, end)
             optimizer.zero_grad()
+            norm = None
+            skipped_update = False
+            skip_reason = None
 
             try:
                 with traincast():
@@ -309,17 +313,26 @@ def update_block_parameters_with_loss(
 
                     total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
 
-                norm = loss_scaler(
+                norm, skipped_update, skip_reason = loss_scaler(
                     total_loss,
                     optimizer,
                     clip_grad=clip_grad,
                     parameters=clip_parameters,
+                    return_metadata=True,
                 )
                 if norm is None:
                     norm = torch.tensor(0.0, device=quant_inputs.device)
                 norm = norm.cpu()
             finally:
                 clear_temp_variable(qlayer)
+
+            if skipped_update:
+                skipped_batches += 1
+                logger.warning(
+                    f"[SkipBatch] BlockUpdate layer {layer_idx} epoch {update_epoch} batch {start // args.batch_size}: "
+                    f"optimizer update skipped due to {skip_reason}"
+                )
+                continue
 
             if clip_grad is not None and float(norm.item()) > float(clip_grad):
                 logger.info(
@@ -333,6 +346,10 @@ def update_block_parameters_with_loss(
             aux_items.append(aux_loss.detach().cpu())
             norm_items.append(norm)
 
+        if not total_items:
+            logger.warning(f"[BlockUpdate] layer {layer_idx} epoch {update_epoch}: all batches skipped")
+            continue
+
         total_mean = torch.stack(total_items).mean().item()
         main_mean = torch.stack(main_items).mean().item()
         aug_mean = torch.stack(aug_items).mean().item()
@@ -343,7 +360,7 @@ def update_block_parameters_with_loss(
         logger.info(
             f"[BlockUpdate] layer {layer_idx} epoch {update_epoch} "
             f"main_loss:{_fmt_metric(main_mean)} aug_loss:{_fmt_metric(aug_mean)} "
-            f"aux_loss:{_fmt_metric(aux_mean)} total_loss:{_fmt_metric(total_mean)} norm:{_fmt_metric(norm_mean)}"
+            f"aux_loss:{_fmt_metric(aux_mean)} total_loss:{_fmt_metric(total_mean)} norm:{_fmt_metric(norm_mean)} skipped:{skipped_batches}"
         )
 
         if aux_enabled and (skipped_aux_missing_teacher or skipped_aux_missing_router or skipped_aux_missing_alignment or skipped_aux_invalid_loss):

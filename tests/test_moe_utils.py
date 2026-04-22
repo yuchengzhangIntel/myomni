@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -18,8 +19,16 @@ from quantize.moe_utils import (  # noqa: E402
     pin_cpu_tensor,
     select_top_n_experts,
 )
-from quantize.block_evaluator import evaluate_block_loss_modes  # noqa: E402
-from quantize.omniquant import build_block_update_param_groups, compute_moe_self_supervision_loss, get_attention_epochs  # noqa: E402
+import quantize.block_evaluator as block_evaluator_module  # noqa: E402
+import quantize.omniquant as omniquant_module  # noqa: E402
+from quantize.block_evaluator import evaluate_block_loss_modes, update_block_parameters_with_loss  # noqa: E402
+from quantize.omniquant import (  # noqa: E402
+    build_block_update_param_groups,
+    build_router_calibration_param_groups,
+    compute_moe_self_supervision_loss,
+    get_attention_epochs,
+    train_decoupled_moe_layer,
+)
 
 
 def build_args():
@@ -543,6 +552,48 @@ def test_build_block_update_param_groups_respects_scope_flags():
     assert len(param_groups) == 2
 
 
+def test_build_router_calibration_param_groups_respects_attention_flag():
+    class FakeQuantLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(1.0))
+            self.lora_A = nn.Parameter(torch.tensor([[1.0]], dtype=torch.float32))
+            self.lora_B = nn.Parameter(torch.tensor([[1.0]], dtype=torch.float32))
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Module()
+            self.self_attn.q_proj = FakeQuantLinear()
+            self.mlp = nn.Module()
+            self.mlp.gate = nn.Linear(1, 1, bias=False)
+
+    qlayer = FakeLayer()
+    args = SimpleNamespace(
+        use_linear_lora=True,
+        router_lr=1e-3,
+        lwc_lr=1e-2,
+        linear_lora_lr=1e-4,
+        wd=0.01,
+        expert_shift_calibration_update_attn=False,
+    )
+
+    selected_params, param_groups = build_router_calibration_param_groups(qlayer, args)
+    selected_ids = {id(param) for param in selected_params}
+    assert id(qlayer.mlp.gate.weight) in selected_ids
+    assert id(qlayer.self_attn.q_proj.bound_factor) not in selected_ids
+    assert len(param_groups) == 1
+
+    args.expert_shift_calibration_update_attn = True
+    selected_params, param_groups = build_router_calibration_param_groups(qlayer, args)
+    selected_ids = {id(param) for param in selected_params}
+    assert id(qlayer.mlp.gate.weight) in selected_ids
+    assert id(qlayer.self_attn.q_proj.bound_factor) in selected_ids
+    assert id(qlayer.self_attn.q_proj.lora_A) in selected_ids
+    assert id(qlayer.self_attn.q_proj.lora_B) in selected_ids
+    assert len(param_groups) == 3
+
+
 def test_evaluate_block_loss_modes_reports_student_only():
     class DummyLogger:
         def info(self, *_args, **_kwargs):
@@ -575,3 +626,261 @@ def test_evaluate_block_loss_modes_reports_student_only():
     )
 
     assert list(results.keys()) == ["student"]
+
+
+def test_update_block_parameters_with_loss_skips_batches_with_nonfinite_norm():
+    class DummyLogger:
+        def __init__(self):
+            self.infos = []
+            self.warnings = []
+
+        def info(self, message, *args, **kwargs):
+            self.infos.append(message)
+
+        def warning(self, message, *args, **kwargs):
+            self.warnings.append(message)
+
+    class ScaledIdentityLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states * self.scale
+
+    class FakeScaler:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, loss, optimizer, clip_grad=None, parameters=None, return_metadata=False, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return torch.tensor(float("inf")), True, "nonfinite_grad_norm"
+
+            loss.backward()
+            optimizer.step()
+            return torch.tensor(0.25), False, None
+
+    qlayer = ScaledIdentityLayer()
+    optimizer = torch.optim.SGD([qlayer.scale], lr=0.1)
+    logger = DummyLogger()
+    quant_inputs = torch.tensor([[[1.0]], [[2.0]]], dtype=torch.float32)
+    fp_targets = torch.zeros_like(quant_inputs)
+
+    final_total = update_block_parameters_with_loss(
+        qlayer=qlayer,
+        args=SimpleNamespace(nsamples=2, batch_size=1, let=False),
+        optimizer=optimizer,
+        loss_scaler=FakeScaler(),
+        clip_parameters=[qlayer.scale],
+        loss_func=nn.MSELoss(),
+        quant_inputs=quant_inputs,
+        fp_targets=fp_targets,
+        fp_targets_aug=None,
+        teacher_router_labels=None,
+        aux_enabled=False,
+        aux_weight=0.0,
+        aux_topk=1,
+        layer_kwargs={},
+        attention_mask_batch=None,
+        position_ids=None,
+        traincast=nullcontext,
+        logger=logger,
+        layer_idx=0,
+        smooth_is_llama=False,
+        update_epochs=1,
+        clip_grad=None,
+    )
+
+    assert abs(final_total - 4.0) < 1e-6
+    assert any("optimizer update skipped due to nonfinite_grad_norm" in msg for msg in logger.warnings)
+
+
+def test_train_decoupled_moe_layer_tracks_stages_and_releases_label_cache_early():
+    class DummyLogger:
+        def __init__(self):
+            self.infos = []
+            self.warnings = []
+
+        def info(self, message, *args, **kwargs):
+            self.infos.append(message)
+
+        def warning(self, message, *args, **kwargs):
+            self.warnings.append(message)
+
+    class DummyGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1, 1))
+            self.top_k = 2
+            self.out_features = 4
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = torch.ones(flat.shape[0], self.out_features, device=hidden_states.device)
+            values, indices = torch.topk(logits, k=self.top_k, dim=-1)
+            return logits, values, indices
+
+    class DummyQuantModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    class DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Identity()
+            self.post_attention_layernorm = nn.Identity()
+            self.self_attn = nn.Module()
+            self.self_attn.q_proj = DummyQuantModule()
+            self.mlp = nn.Module()
+            self.mlp.gate = DummyGate()
+            self.mlp.experts = DummyQuantModule()
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    events = []
+
+    class TrackedCache(list):
+        def __del__(self):
+            events.append("label_cache_released")
+
+    original_build_moe_label_cache = omniquant_module.build_moe_label_cache
+    original_compute_moe_self_supervision_loss = omniquant_module.compute_moe_self_supervision_loss
+    original_compute_fp_block_targets = omniquant_module.compute_fp_block_targets
+    original_capture_teacher_router_labels = omniquant_module.capture_teacher_router_labels
+    original_evaluate_block_loss_modes = omniquant_module.evaluate_block_loss_modes
+    original_train_expert_shift_calibration_stage = omniquant_module.train_expert_shift_calibration_stage
+    original_update_block_parameters_with_loss = omniquant_module.update_block_parameters_with_loss
+    original_compute_quantized_expert_shift_metrics = omniquant_module.compute_quantized_expert_shift_metrics
+    try:
+        def fake_build_moe_label_cache(*args, **kwargs):
+            events.append("label_cache_built")
+            return TrackedCache([{"expert_labels": {}, "shared_labels": None}])
+
+        def fake_compute_moe_self_supervision_loss(qlayer, quant_inputs, *args, **kwargs):
+            return qlayer.mlp.experts.bound_factor * 0 + torch.tensor(1.0, device=quant_inputs.device)
+
+        def fake_compute_fp_block_targets(*args, **kwargs):
+            fp_inputs = args[3]
+            quant_inputs = args[4]
+            return torch.zeros_like(fp_inputs), torch.zeros_like(quant_inputs)
+
+        def fake_capture_teacher_router_labels(*args, **kwargs):
+            return (
+                torch.zeros(2, 1, 2, dtype=torch.float32),
+                torch.zeros(2, 1, 2, dtype=torch.long),
+            )
+
+        def fake_evaluate_block_loss_modes(*args, **kwargs):
+            events.append(f"block_eval:{kwargs['epoch_idx']}")
+            return {"student": {"main": 0.0, "aug": 0.0, "total": 0.0}}
+
+        def fake_train_expert_shift_calibration_stage(*args, **kwargs):
+            assert "label_cache_released" in events
+            events.append("stage2_train")
+            return 0.5
+
+        def fake_update_block_parameters_with_loss(*args, **kwargs):
+            events.append("stage3_train")
+            return 0.25
+
+        def fake_compute_quantized_expert_shift_metrics(*args, **kwargs):
+            events.append(f"shift:{args[4]}")
+            return {"any": 0.1, "half": 0.2, "all": 0.3}
+
+        omniquant_module.build_moe_label_cache = fake_build_moe_label_cache
+        omniquant_module.compute_moe_self_supervision_loss = fake_compute_moe_self_supervision_loss
+        omniquant_module.compute_fp_block_targets = fake_compute_fp_block_targets
+        omniquant_module.capture_teacher_router_labels = fake_capture_teacher_router_labels
+        omniquant_module.evaluate_block_loss_modes = fake_evaluate_block_loss_modes
+        omniquant_module.train_expert_shift_calibration_stage = fake_train_expert_shift_calibration_stage
+        omniquant_module.update_block_parameters_with_loss = fake_update_block_parameters_with_loss
+        omniquant_module.compute_quantized_expert_shift_metrics = fake_compute_quantized_expert_shift_metrics
+
+        layer = DummyLayer()
+        qlayer = DummyLayer()
+        args = SimpleNamespace(
+            let=False,
+            nsamples=2,
+            batch_size=1,
+            epochs=4,
+            attn_epochs=0,
+            lwc_lr=1e-2,
+            linear_lora_lr=1e-4,
+            wd=0.0,
+            max_grad_norm=None,
+            use_linear_lora=False,
+            enable_expert_shift_calibration=True,
+            router_epochs=1,
+            router_lr=1e-3,
+            expert_shift_calibration_update_attn=False,
+            expert_shift_calibration_use_kl=False,
+            enable_block_loss_update=True,
+            block_update_epochs=1,
+            block_update_attn=True,
+            block_update_router=False,
+            block_update_expert=False,
+            block_aux_loss=False,
+            block_aux_loss_weight=0.1,
+            block_eval_interval=2,
+            k_loss=2,
+            k_routing=2,
+            train_gate_lora=False,
+            train_shared_gate=False,
+            calibrate_router=False,
+            aug_loss=True,
+        )
+
+        fp_inputs = torch.zeros(2, 1, 1, dtype=torch.float32)
+        quant_inputs = torch.zeros(2, 1, 1, dtype=torch.float32)
+        final_loss, diagnostics = train_decoupled_moe_layer(
+            layer=layer,
+            qlayer=qlayer,
+            args=args,
+            logger=DummyLogger(),
+            layer_idx=0,
+            fp_inps=fp_inputs,
+            quant_inps=quant_inputs,
+            layer_kwargs={},
+            attention_mask_batch=None,
+            attention_mask=None,
+            position_ids=None,
+            traincast=nullcontext,
+            use_grad_scaler=False,
+            quant_routing_top_n=4,
+            use_router_weight_in_loss=False,
+        )
+
+        gc.collect()
+
+        assert final_loss == 0.25
+        assert diagnostics["expert_shift"]["stage1_pre"]["any"] == 0.1
+        assert diagnostics["expert_shift"]["stage1_post"]["half"] == 0.2
+        assert diagnostics["expert_shift"]["stage2_post"]["all"] == 0.3
+        assert diagnostics["expert_shift"]["stage3_post"]["any"] == 0.1
+        assert events.index("label_cache_released") < events.index("stage2_train")
+        assert events.count("label_cache_built") == 1
+        assert "shift:stage1_pre" in events
+        assert "shift:stage1_post" in events
+        assert "shift:stage2_post" in events
+        assert "shift:stage3_post" in events
+        assert "block_eval:1" in events
+        assert "block_eval:3" in events
+        assert "block_eval:pre_stage2" in events
+        assert "block_eval:post_stage2" in events
+        assert "block_eval:pre_update" in events
+        assert "block_eval:post_update" in events
+    finally:
+        omniquant_module.build_moe_label_cache = original_build_moe_label_cache
+        omniquant_module.compute_moe_self_supervision_loss = original_compute_moe_self_supervision_loss
+        omniquant_module.compute_fp_block_targets = original_compute_fp_block_targets
+        omniquant_module.capture_teacher_router_labels = original_capture_teacher_router_labels
+        omniquant_module.evaluate_block_loss_modes = original_evaluate_block_loss_modes
+        omniquant_module.train_expert_shift_calibration_stage = original_train_expert_shift_calibration_stage
+        omniquant_module.update_block_parameters_with_loss = original_update_block_parameters_with_loss
+        omniquant_module.compute_quantized_expert_shift_metrics = original_compute_quantized_expert_shift_metrics

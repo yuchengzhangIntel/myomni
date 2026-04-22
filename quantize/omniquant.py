@@ -298,6 +298,188 @@ def align_router_logits_for_teacher(router_logits, teacher_indices, logger=None,
     return None
 
 
+DECOUPLED_EXPERT_SHIFT_PHASES = (
+    ("stage1_pre", "Stage1 Pre", {"color": "#1f77b4", "linestyle": "-", "marker": "o"}),
+    ("stage1_post", "Stage1 Post", {"color": "#ff7f0e", "linestyle": "--", "marker": "s"}),
+    ("stage2_post", "Stage2 Post", {"color": "#2ca02c", "linestyle": "-.", "marker": "^"}),
+    ("stage3_post", "Stage3 Post", {"color": "#d62728", "linestyle": ":", "marker": "D"}),
+)
+
+
+def should_track_stage3_expert_shift(args):
+    return bool(
+        getattr(args, "enable_block_loss_update", False)
+        and max(0, int(getattr(args, "block_update_epochs", 1))) > 0
+        and (
+            getattr(args, "block_update_router", False)
+            or getattr(args, "block_update_attn", False)
+        )
+    )
+
+
+def compute_quantized_expert_shift_metrics(
+    qlayer,
+    args,
+    logger,
+    layer_idx,
+    stage_name,
+    quant_inputs,
+    teacher_router_labels,
+    layer_kwargs,
+    attention_mask,
+    position_ids,
+    traincast,
+    max_samples=8,
+):
+    if teacher_router_labels is None:
+        logger.warning(f"[ExpertShift] Layer {layer_idx} {stage_name}: teacher router labels unavailable")
+        return None
+
+    teacher_indices = teacher_router_labels[1]
+    if teacher_indices is None or teacher_indices.numel() == 0:
+        logger.warning(f"[ExpertShift] Layer {layer_idx} {stage_name}: teacher router indices are empty")
+        return None
+
+    num_samples = min(int(max_samples), int(quant_inputs.shape[0]), int(teacher_indices.shape[0]))
+    if num_samples <= 0:
+        logger.warning(f"[ExpertShift] Layer {layer_idx} {stage_name}: no samples available for monitoring")
+        return None
+
+    shift_sums = {"any": 0.0, "half": 0.0, "all": 0.0}
+    valid_samples = 0
+    missing_router_batches = 0
+    invalid_alignment_batches = 0
+
+    set_quant_state(qlayer, weight_quant=False, act_quant=True)
+
+    try:
+        with torch.no_grad():
+            smooth_and_quant_temporary(qlayer, args, isllama=True)
+            for sample_idx in range(num_samples):
+                teacher_idx_sample = teacher_indices[sample_idx : sample_idx + 1]
+                with traincast():
+                    _hidden_states_out, router_logits = forward_with_router_logits(
+                        qlayer,
+                        quant_inputs[sample_idx : sample_idx + 1],
+                        layer_kwargs=layer_kwargs,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                    )
+
+                if router_logits is None:
+                    missing_router_batches += 1
+                    continue
+
+                aligned_router_logits = align_router_logits_for_teacher(
+                    router_logits,
+                    teacher_idx_sample,
+                    logger=logger,
+                    stage_name=f"ExpertShift/{stage_name}",
+                )
+                if aligned_router_logits is None:
+                    invalid_alignment_batches += 1
+                    continue
+
+                shift_metrics = compute_expert_shift_detailed(
+                    aligned_router_logits.float(),
+                    teacher_idx_sample,
+                    getattr(args, "k_routing", 1),
+                )
+                shift_sums["any"] += shift_metrics["shift_any"]
+                shift_sums["half"] += shift_metrics["shift_half"]
+                shift_sums["all"] += shift_metrics["shift_all"]
+                valid_samples += 1
+    finally:
+        clear_temp_variable(qlayer)
+
+    if valid_samples == 0:
+        logger.warning(f"[ExpertShift] Layer {layer_idx} {stage_name}: all monitoring batches were skipped")
+        return None
+
+    averaged_metrics = {
+        metric_name: metric_sum / valid_samples
+        for metric_name, metric_sum in shift_sums.items()
+    }
+    logger.info(
+        f"[ExpertShift] Layer {layer_idx} {stage_name} - "
+        f"Any: {averaged_metrics['any']:.4f}, Half: {averaged_metrics['half']:.4f}, All: {averaged_metrics['all']:.4f}"
+    )
+    if missing_router_batches or invalid_alignment_batches:
+        logger.warning(
+            f"[ExpertShift] Layer {layer_idx} {stage_name}: router_missing={missing_router_batches} "
+            f"alignment_missing={invalid_alignment_batches}"
+        )
+    return averaged_metrics
+
+
+def log_decoupled_expert_shift_scalars(wandb, layer_idx, shift_trace):
+    if wandb is None or not shift_trace:
+        return
+
+    metrics = {
+        "expert_shift/decoupled/layer_id": layer_idx,
+    }
+    for phase_name, phase_metrics in shift_trace.items():
+        if phase_metrics is None:
+            continue
+        for metric_name, value in phase_metrics.items():
+            metrics[f"expert_shift/decoupled/{phase_name}/{metric_name}"] = value
+
+    wandb.log(metrics)
+
+
+def log_decoupled_expert_shift_visualization(wandb, logger, expert_shift_data):
+    if wandb is None or not expert_shift_data:
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        active_phases = [
+            (phase_key, phase_label, style)
+            for phase_key, phase_label, style in DECOUPLED_EXPERT_SHIFT_PHASES
+            if any(entry.get(phase_key) is not None for entry in expert_shift_data)
+        ]
+        if not active_phases:
+            return
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+        for metric_name, ax in zip(("any", "half", "all"), axes):
+            for phase_key, phase_label, style in active_phases:
+                xs = []
+                ys = []
+                for entry in expert_shift_data:
+                    phase_metrics = entry.get(phase_key)
+                    if phase_metrics is None:
+                        continue
+                    xs.append(entry["layer"])
+                    ys.append(phase_metrics[metric_name])
+                if xs:
+                    ax.plot(xs, ys, label=phase_label, **style)
+            ax.set_title(f"shift_{metric_name}")
+            ax.set_xlabel("Layer")
+            ax.set_ylabel("Shift")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+
+        wandb.log({
+            "expert_shift/decoupled_stage_trace": wandb.Image(
+                fig,
+                caption="Decoupled Expert Shift: Stage1 Pre/Post, Stage2 Post, Stage3 Post",
+            )
+        })
+        plt.close(fig)
+        logger.info(
+            f"[ExpertShift] Uploaded decoupled visualization to WandB ({len(expert_shift_data)} layers)"
+        )
+    except ImportError:
+        logger.warning("[ExpertShift] Matplotlib not installed; skipping decoupled visualization.")
+    except Exception as exc:
+        logger.warning(f"[ExpertShift] Failed to create decoupled visualization: {exc}")
+
+
 def train_expert_shift_calibration_stage(
     qlayer,
     args,
@@ -643,11 +825,18 @@ def train_decoupled_moe_layer(
 
     qlayer.float()
     final_stage_loss = None
+    diagnostics = {"expert_shift": {}}
     loss_func = torch.nn.MSELoss()
     clip_grad_max_norm = getattr(args, "max_grad_norm", None)
     attn_epochs = get_attention_epochs(args, layer_idx)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
+    update_stage_enabled = getattr(args, "enable_block_loss_update", False)
+    update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
+    block_aux_enabled = getattr(args, "block_aux_loss", False)
+    block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
+    stage2_enabled = getattr(args, "enable_expert_shift_calibration", False)
+    stage3_shift_enabled = should_track_stage3_expert_shift(args)
 
     attn_lwc_params, attn_lora_params = collect_stage_parameters(
         qlayer,
@@ -659,6 +848,75 @@ def train_decoupled_moe_layer(
         attn_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
     if attn_lora_params:
         attn_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+
+    moe_lwc_params, moe_lora_params = collect_stage_parameters(
+        qlayer,
+        moe_prefixes,
+        include_linear_lora=getattr(args, "use_linear_lora", False),
+    )
+    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
+    moe_param_groups = []
+    if attn_lwc_params:
+        moe_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+    if attn_lora_params:
+        moe_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+    if moe_lwc_params:
+        moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
+    if moe_lora_params:
+        moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
+
+    stage1_moe_enabled = bool(moe_param_groups) and args.epochs > 0
+    stage1_attn_enabled = bool(attn_param_groups) and attn_epochs > 0
+    stage1_training_enabled = stage1_attn_enabled or stage1_moe_enabled
+    expert_shift_monitor_enabled = stage1_training_enabled or stage2_enabled or stage3_shift_enabled
+
+    routing_top_k = get_moe_top_k(layer.mlp)
+    if routing_top_k is None:
+        routing_top_k = 1
+    max_experts = None
+    if hasattr(layer.mlp, "gate"):
+        max_experts = getattr(layer.mlp.gate, "out_features", None)
+        if max_experts is None and hasattr(layer.mlp.gate, "weight"):
+            max_experts = layer.mlp.gate.weight.shape[0]
+    teacher_label_topk = max(routing_top_k, getattr(args, "k_loss", routing_top_k))
+    if max_experts is not None:
+        teacher_label_topk = min(teacher_label_topk, int(max_experts))
+
+    teacher_router_labels = None
+    if block_aux_enabled or expert_shift_monitor_enabled:
+        teacher_router_labels = capture_teacher_router_labels(
+            layer,
+            fp_inps,
+            quant_inps.device,
+            layer_kwargs,
+            topk=teacher_label_topk,
+            logger=logger,
+        )
+        if teacher_router_labels is None:
+            logger.warning(
+                f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, router-aware monitoring will be skipped"
+            )
+    if block_aux_enabled and teacher_router_labels is None:
+        logger.warning(f"[BlockUpdate] Layer {layer_idx}: block auxiliary router loss requested but teacher labels are unavailable")
+    if stage2_enabled and teacher_router_labels is None:
+        logger.warning(f"[ExpertCalib] Layer {layer_idx}: teacher router labels unavailable, stage2 will be skipped")
+
+    if stage1_training_enabled:
+        stage1_pre_metrics = compute_quantized_expert_shift_metrics(
+            qlayer,
+            args,
+            logger,
+            layer_idx,
+            "stage1_pre",
+            quant_inps,
+            teacher_router_labels,
+            layer_kwargs,
+            attention_mask,
+            position_ids,
+            traincast,
+        )
+        if stage1_pre_metrics is not None:
+            diagnostics["expert_shift"]["stage1_pre"] = stage1_pre_metrics
 
     if attn_param_groups and attn_epochs > 0:
         logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {attn_epochs} epochs")
@@ -742,72 +1000,22 @@ def train_decoupled_moe_layer(
         position_ids,
         traincast,
     )
-
-    routing_top_k = get_moe_top_k(layer.mlp)
-    if routing_top_k is None:
-        routing_top_k = 1
-    max_experts = None
-    if hasattr(layer.mlp, "gate"):
-        max_experts = getattr(layer.mlp.gate, "out_features", None)
-        if max_experts is None and hasattr(layer.mlp.gate, "weight"):
-            max_experts = layer.mlp.gate.weight.shape[0]
-    teacher_label_topk = max(routing_top_k, getattr(args, "k_loss", routing_top_k))
-    if max_experts is not None:
-        teacher_label_topk = min(teacher_label_topk, int(max_experts))
     eval_interval = getattr(args, "block_eval_interval", 0)
     periodic_eval_enabled = eval_interval >= 1
-    update_stage_enabled = getattr(args, "enable_block_loss_update", False)
-    update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
-    block_aux_enabled = getattr(args, "block_aux_loss", False)
-    block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
-    stage2_enabled = getattr(args, "enable_expert_shift_calibration", False)
-    teacher_router_labels = None
-    if block_aux_enabled or stage2_enabled:
-        teacher_router_labels = capture_teacher_router_labels(
+    label_cache = None
+    if stage1_moe_enabled:
+        top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
+        logger.info(f"[Decoupled MoE] Layer {layer_idx}: building CPU label cache with top_n={top_n}")
+        label_cache = build_moe_label_cache(
             layer,
             fp_inps,
-            quant_inps.device,
             layer_kwargs,
-            topk=teacher_label_topk,
-            logger=logger,
+            attention_mask,
+            position_ids,
+            top_n,
         )
-        if teacher_router_labels is None:
-            logger.warning(
-                f"[BlockEval] Layer {layer_idx}: teacher router labels unavailable, auxiliary router loss will be skipped"
-            )
-    if block_aux_enabled and teacher_router_labels is None:
-        logger.warning(f"[BlockUpdate] Layer {layer_idx}: block auxiliary router loss requested but teacher labels are unavailable")
-    if stage2_enabled and teacher_router_labels is None:
-        logger.warning(f"[ExpertCalib] Layer {layer_idx}: teacher router labels unavailable, stage2 will be skipped")
 
-    top_n = resolve_quant_routing_top_n(layer.mlp, quant_routing_top_n)
-    logger.info(f"[Decoupled MoE] Layer {layer_idx}: building CPU label cache with top_n={top_n}")
-    label_cache = build_moe_label_cache(
-        layer,
-        fp_inps,
-        layer_kwargs,
-        attention_mask,
-        position_ids,
-        top_n,
-    )
-
-    moe_lwc_params, moe_lora_params = collect_stage_parameters(
-        qlayer,
-        moe_prefixes,
-        include_linear_lora=getattr(args, "use_linear_lora", False),
-    )
-    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
-    moe_param_groups = []
-    if attn_lwc_params:
-        moe_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if attn_lora_params:
-        moe_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-    if moe_lwc_params:
-        moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if moe_lora_params:
-        moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
-
-    if moe_param_groups and args.epochs > 0:
+    if stage1_moe_enabled:
         joint_attn_enabled = bool(joint_moe_attn_params)
         logger.info(
             f"[Decoupled MoE] Layer {layer_idx}: training expert self-supervision for {args.epochs} epochs"
@@ -924,7 +1132,49 @@ def train_decoupled_moe_layer(
                 )
         del moe_optimizer
 
+    if stage1_training_enabled:
+        stage1_post_metrics = compute_quantized_expert_shift_metrics(
+            qlayer,
+            args,
+            logger,
+            layer_idx,
+            "stage1_post",
+            quant_inps,
+            teacher_router_labels,
+            layer_kwargs,
+            attention_mask,
+            position_ids,
+            traincast,
+        )
+        if stage1_post_metrics is not None:
+            diagnostics["expert_shift"]["stage1_post"] = stage1_post_metrics
+
+    if label_cache is not None:
+        label_cache = None
+        gc.collect()
+
+    if teacher_router_labels is not None and not (stage2_enabled or block_aux_enabled or stage3_shift_enabled):
+        teacher_router_labels = None
+
     if stage2_enabled:
+        logger.info(f"[BlockEval] Layer {layer_idx}: pre-stage2 evaluation")
+        evaluate_block_loss_modes(
+            qlayer=qlayer,
+            args=args,
+            loss_func=loss_func,
+            quant_inputs=quant_inps,
+            fp_targets=fp_block_targets,
+            fp_targets_aug=fp_block_targets_aug,
+            layer_kwargs=layer_kwargs,
+            attention_mask_batch=attention_mask_batch,
+            position_ids=position_ids,
+            traincast=traincast,
+            logger=logger,
+            layer_idx=layer_idx,
+            epoch_idx="pre_stage2",
+            smooth_is_llama=True,
+        )
+
         calibration_stage_loss = train_expert_shift_calibration_stage(
             qlayer,
             args,
@@ -940,6 +1190,43 @@ def train_decoupled_moe_layer(
         )
         if calibration_stage_loss is not None:
             final_stage_loss = calibration_stage_loss
+
+        logger.info(f"[BlockEval] Layer {layer_idx}: post-stage2 evaluation")
+        evaluate_block_loss_modes(
+            qlayer=qlayer,
+            args=args,
+            loss_func=loss_func,
+            quant_inputs=quant_inps,
+            fp_targets=fp_block_targets,
+            fp_targets_aug=fp_block_targets_aug,
+            layer_kwargs=layer_kwargs,
+            attention_mask_batch=attention_mask_batch,
+            position_ids=position_ids,
+            traincast=traincast,
+            logger=logger,
+            layer_idx=layer_idx,
+            epoch_idx="post_stage2",
+            smooth_is_llama=True,
+        )
+
+        stage2_post_metrics = compute_quantized_expert_shift_metrics(
+            qlayer,
+            args,
+            logger,
+            layer_idx,
+            "stage2_post",
+            quant_inps,
+            teacher_router_labels,
+            layer_kwargs,
+            attention_mask,
+            position_ids,
+            traincast,
+        )
+        if stage2_post_metrics is not None:
+            diagnostics["expert_shift"]["stage2_post"] = stage2_post_metrics
+
+    if teacher_router_labels is not None and not (block_aux_enabled or stage3_shift_enabled):
+        teacher_router_labels = None
 
     if update_stage_enabled:
         logger.info(f"[BlockUpdate] Layer {layer_idx}: pre-update evaluation")
@@ -1024,9 +1311,25 @@ def train_decoupled_moe_layer(
             smooth_is_llama=True,
         )
 
-    del teacher_router_labels
-    del label_cache
-    return final_stage_loss
+        if stage3_shift_enabled:
+            stage3_post_metrics = compute_quantized_expert_shift_metrics(
+                qlayer,
+                args,
+                logger,
+                layer_idx,
+                "stage3_post",
+                quant_inps,
+                teacher_router_labels,
+                layer_kwargs,
+                attention_mask,
+                position_ids,
+                traincast,
+            )
+            if stage3_post_metrics is not None:
+                diagnostics["expert_shift"]["stage3_post"] = stage3_post_metrics
+
+    teacher_router_labels = None
+    return final_stage_loss, diagnostics
 
 def omniquant(
     lm,
@@ -1062,7 +1365,8 @@ def omniquant(
             logger.warning("WandB not installed but enable_wandb=True. Skipping WandB logging.")
     global_step = 0  # Global step counter for continuous WandB logging across layers
     final_loss = None  # Track the loss from the last epoch of the last layer
-    expert_shift_data = []  # Collect expert shift data per layer for visualization
+    expert_shift_data = []  # Collect legacy expert shift data per layer for visualization
+    decoupled_expert_shift_data = []  # Collect decoupled expert shift data per layer for visualization
     
     # move embedding layer and first layer to target device
     model = lm.model
@@ -1600,7 +1904,7 @@ def omniquant(
 
         if train_current_layer:
             if use_decoupled_moe_training:
-                final_loss = train_decoupled_moe_layer(
+                final_loss, decoupled_diagnostics = train_decoupled_moe_layer(
                     layer,
                     qlayer,
                     args,
@@ -1617,6 +1921,13 @@ def omniquant(
                     quant_routing_top_n,
                     use_router_weight_in_loss,
                 )
+                shift_trace = decoupled_diagnostics.get("expert_shift", {}) if decoupled_diagnostics is not None else {}
+                if shift_trace:
+                    decoupled_expert_shift_data.append({
+                        "layer": i,
+                        **shift_trace,
+                    })
+                    log_decoupled_expert_shift_scalars(wandb, i, shift_trace)
             else:
                 with torch.no_grad():
                     qlayer.float()      # required for AMP training
@@ -2049,6 +2360,9 @@ def omniquant(
             logger.warning("[Expert Shift] Matplotlib not installed; skipping custom visualization.")
         except Exception as e:
             logger.warning(f"[Expert Shift] Failed to create Matplotlib visualization: {e}")
+
+    if wandb is not None and len(decoupled_expert_shift_data) > 0:
+        log_decoupled_expert_shift_visualization(wandb, logger, decoupled_expert_shift_data)
     
     return model, final_loss
 
