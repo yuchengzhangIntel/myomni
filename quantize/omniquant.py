@@ -693,6 +693,10 @@ def get_attention_epochs(args, layer_idx=None):
     return base_attn_epochs + max(layer_idx, 0) // 2
 
 
+def should_keep_layer_full_precision(layer_idx, max_train_layers):
+    return max_train_layers >= 0 and layer_idx >= max_train_layers
+
+
 def build_moe_label_cache(layer, fp_inputs, layer_kwargs, attention_mask, position_ids, top_n):
     label_cache = []
     shared_expert = get_shared_expert_module(layer.mlp)
@@ -1539,6 +1543,16 @@ def omniquant(
         layer_param = next(layer.parameters(), None)
         layer_dtype = layer_param.dtype if layer_param is not None else torch.float16
         current_fp_layer_inputs = fp_inps
+        max_train_layers = getattr(args, "max_train_layers", -1)
+        if should_keep_layer_full_precision(i, max_train_layers):
+            logger.info(
+                f"[FastCheck] Layer {i}: stop quantization after the first {max_train_layers} layers; "
+                "remaining layers stay full precision"
+            )
+            layers[i] = layer.to("cpu")
+            torch.cuda.empty_cache()
+            break
+
         if "mixtral" in args.net.lower() or "qwen" in args.net.lower() or "deepseek" in args.net.lower():  
             # For MoE models (Mixtral, Qwen/DeepSeek MoE), only the LWC-style path is supported.
             # Simply replace Linear with QuantLinear, do not quantize router (gate)
@@ -1605,13 +1619,7 @@ def omniquant(
             or stage2_calibration_enabled
             or (getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0)
         )
-        max_train_layers = getattr(args, "max_train_layers", -1)
-        within_train_limit = max_train_layers < 0 or i < max_train_layers
-        train_current_layer = base_train_current_layer and within_train_limit
-        if base_train_current_layer and not within_train_limit:
-            logger.info(
-                f"[FastCheck] Layer {i}: skip training because max_train_layers={max_train_layers}"
-            )
+        train_current_layer = base_train_current_layer
 
         # =================================================================
         # Legacy Expert Shift Tracking for Router Calibration

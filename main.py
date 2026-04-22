@@ -493,7 +493,7 @@ def main():
     parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
                         help="Weight for router auxiliary loss in block-wise update stage")
     parser.add_argument("--max_train_layers", type=int, default=-1,
-                        help="Train at most the first N layers; use -1 for all layers, 1 for first block only")
+                        help="Quantize/train at most the first N layers; later layers stay full precision. Use -1 for all layers, 1 for first block only")
 
     args = parser.parse_args()
     if args.attn_epochs is None:
@@ -608,7 +608,7 @@ def main():
     logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
-    logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
+    logger.info(f"  Max Quantized Layers      : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
 
     if args.enable_wandb:
@@ -783,7 +783,7 @@ def main():
     logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
     logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
                 + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
-    logger.info(f"  Max Train Layers          : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
+    logger.info(f"  Max Quantized Layers      : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results
     wiki2_ppl = results.get('wikitext2', 'N/A')

@@ -27,6 +27,7 @@ from quantize.omniquant import (  # noqa: E402
     build_router_calibration_param_groups,
     compute_moe_self_supervision_loss,
     get_attention_epochs,
+    should_keep_layer_full_precision,
     train_decoupled_moe_layer,
 )
 
@@ -120,6 +121,13 @@ def test_quantized_packed_experts_matches_packed_forward():
 
     actual = quantized(hidden_states, top_k_index, top_k_weights)
     assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def test_should_keep_layer_full_precision_respects_max_train_layers():
+    assert should_keep_layer_full_precision(layer_idx=0, max_train_layers=-1) is False
+    assert should_keep_layer_full_precision(layer_idx=0, max_train_layers=1) is False
+    assert should_keep_layer_full_precision(layer_idx=1, max_train_layers=1) is True
+    assert should_keep_layer_full_precision(layer_idx=3, max_train_layers=2) is True
 
 
 def test_router_score_selection_normalizes_top_n_weights():
