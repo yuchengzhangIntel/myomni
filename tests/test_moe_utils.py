@@ -4,6 +4,7 @@ import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,6 +20,7 @@ from quantize.moe_utils import (  # noqa: E402
     pin_cpu_tensor,
     select_top_n_experts,
 )
+import utils as root_utils_module  # noqa: E402
 import quantize.block_evaluator as block_evaluator_module  # noqa: E402
 import quantize.omniquant as omniquant_module  # noqa: E402
 from quantize.block_evaluator import evaluate_block_loss_modes, update_block_parameters_with_loss  # noqa: E402
@@ -702,6 +704,315 @@ def test_update_block_parameters_with_loss_skips_batches_with_nonfinite_norm():
 
     assert abs(final_total - 4.0) < 1e-6
     assert any("optimizer update skipped due to nonfinite_grad_norm" in msg for msg in logger.warnings)
+
+
+def test_native_scaler_updates_grad_scaler_state_when_large_grad_skips_step():
+    class FakeScaledLoss:
+        def __init__(self, loss):
+            self.loss = loss
+
+        def backward(self, create_graph=False, retain_graph=False):
+            self.loss.backward(create_graph=create_graph, retain_graph=retain_graph)
+
+    class FakeGradScaler:
+        def __init__(self):
+            self.scale_value = 128.0
+            self.stage = "ready"
+            self.step_calls = 0
+            self.update_args = []
+
+        def scale(self, loss):
+            return FakeScaledLoss(loss)
+
+        def unscale_(self, optimizer):
+            if self.stage != "ready":
+                raise RuntimeError("unscale_() has already been called on this optimizer since the last update().")
+            self.stage = "unscaled"
+
+        def step(self, optimizer):
+            if self.stage != "unscaled":
+                raise RuntimeError("step() called before unscale_().")
+            self.step_calls += 1
+            self.stage = "stepped"
+
+        def update(self, new_scale=None):
+            self.update_args.append(new_scale)
+            self.stage = "ready"
+
+        def get_scale(self):
+            return self.scale_value
+
+    scaler = root_utils_module.NativeScalerWithGradNormCount(use_grad_scaler=False, max_grad_norm_for_update=1.0)
+    fake_scaler = FakeGradScaler()
+    scaler._use_grad_scaler = True
+    scaler._scaler = fake_scaler
+
+    original_get_grad_norm = root_utils_module.ampscaler_get_grad_norm
+    try:
+        root_utils_module.ampscaler_get_grad_norm = lambda parameters, norm_type=2.0: torch.tensor(1e5)
+
+        parameter = nn.Parameter(torch.tensor(2.0))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            loss = parameter.square()
+            norm, skipped_update, skip_reason = scaler(
+                loss,
+                optimizer,
+                parameters=[parameter],
+                return_metadata=True,
+            )
+
+            assert skipped_update is True
+            assert skip_reason == "grad_norm_too_large"
+            assert float(norm.detach().item()) == 1e5
+            assert parameter.grad is None
+
+        assert fake_scaler.step_calls == 0
+        assert fake_scaler.update_args == [fake_scaler.scale_value, fake_scaler.scale_value]
+    finally:
+        root_utils_module.ampscaler_get_grad_norm = original_get_grad_norm
+
+
+def test_train_decoupled_moe_layer_clears_temp_weights_when_attention_stage_raises():
+    class DummyLogger:
+        def __init__(self):
+            self.infos = []
+            self.warnings = []
+
+        def info(self, message, *args, **kwargs):
+            self.infos.append(message)
+
+        def warning(self, message, *args, **kwargs):
+            self.warnings.append(message)
+
+    class DummyGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1, 1))
+            self.top_k = 1
+            self.out_features = 1
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = torch.ones(flat.shape[0], self.out_features, device=hidden_states.device)
+            return logits, logits, torch.zeros(flat.shape[0], 1, dtype=torch.long, device=hidden_states.device)
+
+    class DummyQuantModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    class DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Identity()
+            self.post_attention_layernorm = nn.Identity()
+            self.self_attn = nn.Module()
+            self.self_attn.q_proj = DummyQuantModule()
+            self.mlp = nn.Module()
+            self.mlp.gate = DummyGate()
+            self.mlp.experts = DummyQuantModule()
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    class RaisingScaler:
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("attention backward failed")
+
+    events = []
+    original_scaler_cls = omniquant_module.utils.NativeScalerWithGradNormCount
+    original_capture_teacher_router_labels = omniquant_module.capture_teacher_router_labels
+    original_compute_attention_outputs = omniquant_module.compute_attention_outputs
+    original_smooth_and_quant_temporary = omniquant_module.smooth_and_quant_temporary
+    original_clear_temp_variable = omniquant_module.clear_temp_variable
+    try:
+        omniquant_module.utils.NativeScalerWithGradNormCount = lambda *args, **kwargs: RaisingScaler()
+        omniquant_module.capture_teacher_router_labels = lambda *args, **kwargs: None
+        omniquant_module.smooth_and_quant_temporary = lambda *args, **kwargs: events.append("smooth")
+        omniquant_module.clear_temp_variable = lambda *args, **kwargs: events.append("clear")
+
+        layer = DummyLayer()
+        qlayer = DummyLayer()
+
+        def fake_compute_attention_outputs(current_layer, hidden_states, *args, **kwargs):
+            if current_layer is qlayer:
+                return hidden_states + current_layer.self_attn.q_proj.bound_factor
+            return torch.zeros_like(hidden_states)
+
+        omniquant_module.compute_attention_outputs = fake_compute_attention_outputs
+
+        args = SimpleNamespace(
+            let=False,
+            nsamples=1,
+            batch_size=1,
+            epochs=0,
+            attn_epochs=1,
+            lwc_lr=1e-2,
+            linear_lora_lr=1e-4,
+            wd=0.0,
+            max_grad_norm=None,
+            use_linear_lora=False,
+            enable_expert_shift_calibration=False,
+            enable_block_loss_update=False,
+            block_aux_loss=False,
+            k_loss=1,
+            k_routing=1,
+        )
+
+        with pytest.raises(RuntimeError, match="attention backward failed"):
+            train_decoupled_moe_layer(
+                layer=layer,
+                qlayer=qlayer,
+                args=args,
+                logger=DummyLogger(),
+                layer_idx=0,
+                fp_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
+                quant_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
+                layer_kwargs={},
+                attention_mask_batch=None,
+                attention_mask=None,
+                position_ids=None,
+                traincast=nullcontext,
+                use_grad_scaler=False,
+                quant_routing_top_n=1,
+                use_router_weight_in_loss=False,
+            )
+
+        assert events == ["smooth", "clear"]
+    finally:
+        omniquant_module.utils.NativeScalerWithGradNormCount = original_scaler_cls
+        omniquant_module.capture_teacher_router_labels = original_capture_teacher_router_labels
+        omniquant_module.compute_attention_outputs = original_compute_attention_outputs
+        omniquant_module.smooth_and_quant_temporary = original_smooth_and_quant_temporary
+        omniquant_module.clear_temp_variable = original_clear_temp_variable
+
+
+def test_train_decoupled_moe_layer_clears_temp_weights_when_moe_stage_raises():
+    class DummyLogger:
+        def __init__(self):
+            self.infos = []
+            self.warnings = []
+
+        def info(self, message, *args, **kwargs):
+            self.infos.append(message)
+
+        def warning(self, message, *args, **kwargs):
+            self.warnings.append(message)
+
+    class DummyGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1, 1))
+            self.top_k = 1
+            self.out_features = 1
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = torch.ones(flat.shape[0], self.out_features, device=hidden_states.device)
+            return logits, logits, torch.zeros(flat.shape[0], 1, dtype=torch.long, device=hidden_states.device)
+
+    class DummyQuantModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    class DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Identity()
+            self.post_attention_layernorm = nn.Identity()
+            self.self_attn = nn.Module()
+            self.self_attn.q_proj = DummyQuantModule()
+            self.mlp = nn.Module()
+            self.mlp.gate = DummyGate()
+            self.mlp.experts = DummyQuantModule()
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    class RaisingScaler:
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("moe backward failed")
+
+    events = []
+    original_scaler_cls = omniquant_module.utils.NativeScalerWithGradNormCount
+    original_capture_teacher_router_labels = omniquant_module.capture_teacher_router_labels
+    original_compute_fp_block_targets = omniquant_module.compute_fp_block_targets
+    original_build_moe_label_cache = omniquant_module.build_moe_label_cache
+    original_compute_moe_self_supervision_loss = omniquant_module.compute_moe_self_supervision_loss
+    original_smooth_and_quant_temporary = omniquant_module.smooth_and_quant_temporary
+    original_clear_temp_variable = omniquant_module.clear_temp_variable
+    try:
+        omniquant_module.utils.NativeScalerWithGradNormCount = lambda *args, **kwargs: RaisingScaler()
+        omniquant_module.capture_teacher_router_labels = lambda *args, **kwargs: None
+        omniquant_module.compute_fp_block_targets = lambda *args, **kwargs: (
+            torch.zeros_like(args[3]),
+            torch.zeros_like(args[4]),
+        )
+        omniquant_module.build_moe_label_cache = lambda *args, **kwargs: [{"expert_labels": {}, "shared_labels": None}]
+        omniquant_module.compute_moe_self_supervision_loss = (
+            lambda qlayer, quant_inputs, *args, **kwargs: qlayer.mlp.experts.bound_factor * 0
+            + torch.tensor(1.0, device=quant_inputs.device)
+        )
+        omniquant_module.smooth_and_quant_temporary = lambda *args, **kwargs: events.append("smooth")
+        omniquant_module.clear_temp_variable = lambda *args, **kwargs: events.append("clear")
+
+        args = SimpleNamespace(
+            let=False,
+            nsamples=1,
+            batch_size=1,
+            epochs=1,
+            attn_epochs=0,
+            lwc_lr=1e-2,
+            linear_lora_lr=1e-4,
+            wd=0.0,
+            max_grad_norm=None,
+            use_linear_lora=False,
+            enable_expert_shift_calibration=False,
+            enable_block_loss_update=False,
+            block_aux_loss=False,
+            k_loss=1,
+            k_routing=1,
+            aug_loss=False,
+        )
+
+        with pytest.raises(RuntimeError, match="moe backward failed"):
+            train_decoupled_moe_layer(
+                layer=DummyLayer(),
+                qlayer=DummyLayer(),
+                args=args,
+                logger=DummyLogger(),
+                layer_idx=0,
+                fp_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
+                quant_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
+                layer_kwargs={},
+                attention_mask_batch=None,
+                attention_mask=None,
+                position_ids=None,
+                traincast=nullcontext,
+                use_grad_scaler=False,
+                quant_routing_top_n=1,
+                use_router_weight_in_loss=False,
+            )
+
+        assert events == ["smooth", "clear"]
+    finally:
+        omniquant_module.utils.NativeScalerWithGradNormCount = original_scaler_cls
+        omniquant_module.capture_teacher_router_labels = original_capture_teacher_router_labels
+        omniquant_module.compute_fp_block_targets = original_compute_fp_block_targets
+        omniquant_module.build_moe_label_cache = original_build_moe_label_cache
+        omniquant_module.compute_moe_self_supervision_loss = original_compute_moe_self_supervision_loss
+        omniquant_module.smooth_and_quant_temporary = original_smooth_and_quant_temporary
+        omniquant_module.clear_temp_variable = original_clear_temp_variable
 
 
 def test_train_decoupled_moe_layer_tracks_stages_and_releases_label_cache_early():

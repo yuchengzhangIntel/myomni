@@ -935,51 +935,52 @@ def train_decoupled_moe_layer(
                 end = min(start + args.batch_size, args.nsamples)
                 batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
                 attn_optimizer.zero_grad()
-                with torch.no_grad():
+                try:
+                    with torch.no_grad():
+                        with traincast():
+                            teacher_attn_outputs = compute_attention_outputs(
+                                layer,
+                                fp_inps[start:end],
+                                layer_kwargs,
+                                attention_mask=batch_attention_mask,
+                                position_ids=position_ids,
+                            )
                     with traincast():
-                        teacher_attn_outputs = compute_attention_outputs(
-                            layer,
-                            fp_inps[start:end],
+                        smooth_and_quant_temporary(qlayer, args, isllama=True)
+                        student_attn_outputs = compute_attention_outputs(
+                            qlayer,
+                            quant_inps[start:end],
                             layer_kwargs,
                             attention_mask=batch_attention_mask,
                             position_ids=position_ids,
                         )
-                with traincast():
-                    smooth_and_quant_temporary(qlayer, args, isllama=True)
-                    student_attn_outputs = compute_attention_outputs(
-                        qlayer,
-                        quant_inps[start:end],
-                        layer_kwargs,
-                        attention_mask=batch_attention_mask,
-                        position_ids=position_ids,
+                        loss = loss_func(student_attn_outputs, teacher_attn_outputs)
+                    norm, skipped_update, skip_reason = attn_scaler(
+                        loss,
+                        attn_optimizer,
+                        clip_grad=clip_grad_max_norm,
+                        parameters=attn_clip_params,
+                        return_metadata=True,
                     )
-                    loss = loss_func(student_attn_outputs, teacher_attn_outputs)
-                norm, skipped_update, skip_reason = attn_scaler(
-                    loss,
-                    attn_optimizer,
-                    clip_grad=clip_grad_max_norm,
-                    parameters=attn_clip_params,
-                    return_metadata=True,
-                )
-                if skipped_update:
-                    skipped_batches += 1
-                    logger.warning(
-                        f"[SkipBatch] Decoupled Attention layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
-                        f"optimizer update skipped due to {skip_reason}"
-                    )
+                    if skipped_update:
+                        skipped_batches += 1
+                        logger.warning(
+                            f"[SkipBatch] Decoupled Attention layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
+                            f"optimizer update skipped due to {skip_reason}"
+                        )
+                        continue
+                    if norm is None:
+                        norm = torch.tensor(0.0, device=quant_inps.device)
+                    norm = norm.cpu()
+                    if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
+                        logger.info(
+                            f"[GradClip] Decoupled Attention layer {layer_idx} epoch {epoch} "
+                            f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
+                        )
+                    loss_list.append(loss.detach().cpu())
+                    norm_list.append(norm)
+                finally:
                     clear_temp_variable(qlayer)
-                    continue
-                if norm is None:
-                    norm = torch.tensor(0.0, device=quant_inps.device)
-                norm = norm.cpu()
-                if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
-                    logger.info(
-                        f"[GradClip] Decoupled Attention layer {layer_idx} epoch {epoch} "
-                        f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
-                    )
-                loss_list.append(loss.detach().cpu())
-                norm_list.append(norm)
-                clear_temp_variable(qlayer)
 
             if not loss_list:
                 logger.warning(f"[Decoupled Attention] Layer {layer_idx} epoch {epoch}: all batches skipped")
@@ -1036,75 +1037,75 @@ def train_decoupled_moe_layer(
                 end = min(start + args.batch_size, args.nsamples)
                 batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
                 moe_optimizer.zero_grad()
-                with traincast():
-                    smooth_and_quant_temporary(qlayer, args, isllama=True)
-                with traincast():
-                    if joint_attn_enabled:
-                        loss = compute_moe_self_supervision_loss(
-                            qlayer,
-                            quant_inps[start:end],
-                            label_cache[start:end],
-                            layer_kwargs,
-                            batch_attention_mask,
-                            position_ids,
-                            use_router_weight_in_loss,
-                        )
-                    else:
-                        with torch.no_grad():
-                            _, _, detached_mlp_inputs = compute_mlp_inputs(
+                try:
+                    with traincast():
+                        smooth_and_quant_temporary(qlayer, args, isllama=True)
+                    with traincast():
+                        if joint_attn_enabled:
+                            loss = compute_moe_self_supervision_loss(
                                 qlayer,
                                 quant_inps[start:end],
+                                label_cache[start:end],
                                 layer_kwargs,
-                                attention_mask=batch_attention_mask,
-                                position_ids=position_ids,
+                                batch_attention_mask,
+                                position_ids,
+                                use_router_weight_in_loss,
                             )
-                            detached_mlp_inputs = detached_mlp_inputs.detach()
-                        loss = compute_moe_self_supervision_loss(
-                            qlayer,
-                            quant_inps[start:end],
-                            label_cache[start:end],
-                            layer_kwargs,
-                            batch_attention_mask,
-                            position_ids,
-                            use_router_weight_in_loss,
-                            precomputed_mlp_inputs=detached_mlp_inputs,
+                        else:
+                            with torch.no_grad():
+                                _, _, detached_mlp_inputs = compute_mlp_inputs(
+                                    qlayer,
+                                    quant_inps[start:end],
+                                    layer_kwargs,
+                                    attention_mask=batch_attention_mask,
+                                    position_ids=position_ids,
+                                )
+                                detached_mlp_inputs = detached_mlp_inputs.detach()
+                            loss = compute_moe_self_supervision_loss(
+                                qlayer,
+                                quant_inps[start:end],
+                                label_cache[start:end],
+                                layer_kwargs,
+                                batch_attention_mask,
+                                position_ids,
+                                use_router_weight_in_loss,
+                                precomputed_mlp_inputs=detached_mlp_inputs,
+                            )
+                    if not torch.isfinite(loss.detach()):
+                        skipped_batches += 1
+                        logger.warning(
+                            f"[SkipBatch] Decoupled MoE layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
+                            "non-finite teacher-forcing loss"
                         )
-                if not torch.isfinite(loss.detach()):
-                    skipped_batches += 1
-                    logger.warning(
-                        f"[SkipBatch] Decoupled MoE layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
-                        "non-finite teacher-forcing loss"
-                    )
-                    clear_temp_variable(qlayer)
-                    moe_optimizer.zero_grad(set_to_none=True)
-                    continue
+                        moe_optimizer.zero_grad(set_to_none=True)
+                        continue
 
-                norm, skipped_update, skip_reason = moe_scaler(
-                    loss,
-                    moe_optimizer,
-                    clip_grad=clip_grad_max_norm,
-                    parameters=moe_clip_params,
-                    return_metadata=True,
-                )
-                if skipped_update:
-                    skipped_batches += 1
-                    logger.warning(
-                        f"[SkipBatch] Decoupled MoE layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
-                        f"optimizer update skipped due to {skip_reason}"
+                    norm, skipped_update, skip_reason = moe_scaler(
+                        loss,
+                        moe_optimizer,
+                        clip_grad=clip_grad_max_norm,
+                        parameters=moe_clip_params,
+                        return_metadata=True,
                     )
+                    if skipped_update:
+                        skipped_batches += 1
+                        logger.warning(
+                            f"[SkipBatch] Decoupled MoE layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
+                            f"optimizer update skipped due to {skip_reason}"
+                        )
+                        continue
+                    if norm is None:
+                        norm = torch.tensor(0.0, device=quant_inps.device)
+                    norm = norm.cpu()
+                    if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
+                        logger.info(
+                            f"[GradClip] Decoupled MoE layer {layer_idx} epoch {epoch} "
+                            f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
+                        )
+                    loss_list.append(loss.detach().cpu())
+                    norm_list.append(norm)
+                finally:
                     clear_temp_variable(qlayer)
-                    continue
-                if norm is None:
-                    norm = torch.tensor(0.0, device=quant_inps.device)
-                norm = norm.cpu()
-                if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
-                    logger.info(
-                        f"[GradClip] Decoupled MoE layer {layer_idx} epoch {epoch} "
-                        f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
-                    )
-                loss_list.append(loss.detach().cpu())
-                norm_list.append(norm)
-                clear_temp_variable(qlayer)
 
             if not loss_list:
                 logger.warning(f"[Decoupled MoE] Layer {layer_idx} epoch {epoch}: all batches skipped")
