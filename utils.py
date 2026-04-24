@@ -91,6 +91,10 @@ class NativeScalerWithGradNormCount:
                     skipped_update = True
                     skip_reason = "nonfinite_grad_norm"
                 elif is_too_large:
+                    # unscale_() has already recorded optimizer state for this
+                    # iteration.  Reset the scaler bookkeeping without changing
+                    # the dynamic scale so the next iteration starts clean.
+                    self._scaler.update(new_scale=self._scaler.get_scale())
                     optimizer.zero_grad(set_to_none=True)
                     skipped_update = True
                     skip_reason = "grad_norm_too_large"
