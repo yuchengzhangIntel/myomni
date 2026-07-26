@@ -1,218 +1,141 @@
-# OmniQuant: Omnidirectionally Calibrated Quantization for Large Language Models
+# myomni
 
-<h5 align="center">
+这是基于 OmniQuant 改出来的 Qwen1.5-MoE / Qwen3 MoE 2-bit 量化实验代码库。
 
-[![arXiv](https://img.shields.io/badge/OmniQuant-2308.13137-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2308.13137)
-[![jiqizhixin](https://img.shields.io/badge/机器之心%20-black)](https://mp.weixin.qq.com/s/za2ptWT1_li99-YmjcXQAg)
-[![zhihu](https://img.shields.io/badge/知乎-0084FF)](https://zhuanlan.zhihu.com/p/685805699)
-[![License](https://img.shields.io/badge/Code%20License-MIT-yellow)](https://github.com/OpenGVLab/OmniQuant/blob/main/LICENCE)
-[![GitHub Stars](https://img.shields.io/github/stars/OpenGVLab/OmniQuant.svg?style=social&label=Star&maxAge=60)](https://github.com/OpenGVLab/OmniQuant)🔥🔥🔥
- <br>
+对应实验报告：飞书文档 `PKbndGuQtoqECFxBnBBlSO0cgvO`，revision `973`。
 
-</h5>
+## 主要结构
 
-  
-
-![omniquant](imgs/OmniQuant.png)
-
-OmniQuant is a simple and powerful quantization technique for LLMs. The current release supports:
-- OmniQuant algorithm for accurate weight-only quantization (`W4A16`/`W3A16`/`W2A16`) and weight-activation quantization (`W6A6`, `W4A4`)
-- Pre-trained Omniquant model zoo for LLMs (`LLaMA-1&2`, `LLaMA-2-Chat`, `OPT`, `Falcon`, `Mixtral-7Bx8`; load to generate quantized weights).
-- A out-of-the-box case that leverages MLC-LLM to run LLaMa-2-Chat (7B/13B) with W3A16g128 quantization on GPUs and mobile phones.
-
-
-## News
-- [2025/11] 🔥 **We open-source [INT vs. FP](https://github.com/ChenMnZ/INT_vs_FP), a framework to compare low-bit integer and float-point formats, including MXFP8/MXFP6/MXFP4/NVFP4 and MXINT8/MXINT6/MXINT4/NVINT4.**
-- [2025/05] 🔥 We explore the [Scaling Law for Quantization-Aware Training](https://export.arxiv.org/abs/2505.14302), which offers insights and instruction for LLMs QAT.
-- [2024/10] 🔥 We release a new weight-activation quantization algorithm, [PrefixQuant](https://github.com/ChenMnZ/PrefixQuant), which proposed an efficient method to isolate sink token (token-wise outlier).
-- [2024/7] 🔥 We release a new quantization algorithm, [EfficientQAT](https://github.com/OpenGVLab/EfficientQAT), which realizes quantization-aware training in a time-efficient and memory-efficient manner. Additionally, EfficientQAT is the current SoTA of uniform quantization.
-- [2024/1] 🌟 Our OmniQuant paper has been accepted for a Spotlight presentation at ICLR 2024 (only top 5% out of over 7200 submissions)! 🎉 Cheers!
-- [2023/12] 🔥 We provide support for Mixtral-8x7B. OmniQuant is capable of achieving near-lossless 4-bit quantization with Mixtral-8x7B-v0.1, which reduces the memory requirement from 87GB to 23GB.
-- [2023/09] 🔥 We have expanded support for Falcon. OmniQuant efficiently compresses Falcon-180b from 335G to 65G, with minimal performance loss. Furthermore, this compression allows for Falcon-180b inference on a single A100 80GB GPU. For details, refer to [runing_falcon180b_on_single_a100_80g](./runing_falcon180b_on_single_a100_80g.ipynb).
-![falcon-180b](imgs/falcon_180b.png)
-
-
-## Contents
-- [Install](#install)
-- [Omniquant Model Zoo](#omniquant-model-zoo)
-- [Usage](#usage)
-- [Inference with MLC-LLM](#runing-quantized-models-with-mlc-llm)
-- [Results](#results)
-- [Citation](#citation)
-
-## Install
-```
-conda create -n omniquant python=3.10 -y
-conda activate omniquant
-git clone https://github.com/OpenGVLab/OmniQuant.git
-cd OmniQuant
-pip install --upgrade pip 
-pip install -e .
+```mermaid
+flowchart LR
+    main[main.py] --> data[校准集 dataloader]
+    main --> oq[quantize/omniquant.py]
+    oq --> s0[Stage0 注意力预对齐]
+    oq --> s1[Stage1 专家自监督]
+    oq --> s2[Stage2 路由校准]
+    oq --> s3[Stage3 整块重建]
+    s3 --> eval[评测: PPL + lm-eval]
 ```
 
-We also leverage the kernel from [AutoGPTQ](https://github.com/PanQiWei/AutoGPTQ) to achieve real quantization. So you should also install the bug-fixed AutoGPTQ as follows::
-```
-git clone https://github.com/ChenMnZ/AutoGPTQ-bugfix
-pip install -v .
-```
+- `main.py`：训练入口。负责解析参数、加载模型、构建校准集、调用 `omniquant`，最后跑 PPL / lm-eval。
+- `quantize/omniquant.py`：主要训练逻辑。Qwen / DeepSeek MoE 走 staged decoupled 路径。
+- `quantize/moe_utils.py`：MoE 专家选择、router score、packed experts、expert output 等工具。
+- `quantize/block_evaluator.py`：Stage3 整块重建相关工具。
+- `scripts/qwen/**`：报告里的 Qwen 实验脚本。
+- `tests/stage0_smoke/`：单层 smoke 脚本，用于快速检查代码路径。
 
+张量形状记忆点：每层校准 hidden states 主要按
+`[nsamples, seqlen, hidden_size]` 缓存；每个 stage 只更新当前 decoder layer 中被开关选中的模块组。
 
-## OmniQuant Model Zoo
-We provide pre-trained Omniquant model zoo for multiple model families, including LLaMa-1&2, LLaMa-2-Chat, OPT.
+## 模型路径
 
-You can download the pre-trained OmniQuant parameters you need at [Huggingface](https://huggingface.co/ChenMnZ/OmniQuant/tree/main).
+所有 Qwen 脚本默认使用 Hugging Face repo id：
 
-The detailed support list:
-| Models  | Sizes                           | W2A16 | W2A16g128 | W2A16g64 | W3A16 |
-| ------- | ------------------------------- | ----- | --------- | -------- | ----- |
-| LLaMA   | 7B/13B/30B/65B                  | ✅     | ✅         | ✅        | ✅     |
-| LLaMA-2 | 7B/13B/70B                      | ✅     | ✅         | ✅        | ✅     |
-| OPT     | 125m/1.3B/2.7B/6.7B/13B/30B/66B | ✅     | ✅         | ✅        | ✅     |
+- Qwen1.5：`Qwen/Qwen1.5-MoE-A2.7B`
+- Qwen3：`Qwen/Qwen3-30B-A3B`
 
-| Models       | Sizes                           | W3A16g128 | W4A16 | W4A16g128 | W6A6 | W4A4 |
-| ------------ | ------------------------------- | --------- | ----- | --------- | ---- | ---- |
-| LLaMA        | 7B/13B/30B/65B                  | ✅         | ✅     | ✅         | ✅    | ✅    |
-| LLaMA-2      | 7B/13B/70B                      | ✅         | ✅     | ✅         | ✅    | ✅    |
-| OPT          | 125m/1.3B/2.7B/6.7B/13B/30B/66B | ✅         | ✅     | ✅         | ✅    | ✅    |
-| LLaMA-2-Chat | 7B/13B                          | ✅         |       |           |      |      |
+如果本机已经有模型，可以覆盖路径：
 
-
-## Usage
-**We provide full script to run OmniQuant in `./scripts/`**. We use LLaMa-7B as an example here:
-1. Obtain the channel-wise scales and shifts required for initialization:
-```
-conda install git git-lfs
-git lfs install
-git clone https://huggingface.co/ChenMnZ/act_shifts
-git clone https://huggingface.co/ChenMnZ/act_scales
+```bash
+export QWEN15_MODEL_PATH=/tmp/Qwen1.5-MoE-A2.7B
+export QWEN3_MODEL_PATH=/tmp/Qwen3-30B-A3B
 ```
 
-Optional, we also offer the script that you can generate channel-wise scales and shifts by yourself:
-```
-python generate_act_scale_shift.py --model /PATH/TO/LLaMA/llama-7b
-```
+下载两个模型到 `/tmp`：
 
-2. Weight-only quantization
-```
-# W3A16
-CUDA_VISIBLE_DEVICES=0 python main.py \
---model /PATH/TO/LLaMA/llama-7b  \
---epochs 20 --output_dir ./log/llama-7b-w3a16 \
---eval_ppl --wbits 3 --abits 16 --lwc
-
-# W3A16g128
-CUDA_VISIBLE_DEVICES=0 python main.py \
---model /PATH/TO/LLaMA/llama-7b  \
---epochs 20 --output_dir ./log/llama-7b-w3a16g128 \
---eval_ppl --wbits 3 --abits 16 --group_size 128 --lwc
+```bash
+bash scripts/qwen/download_models.sh
 ```
 
-3. weight-activation quantization
-```
-# W4A4
-CUDA_VISIBLE_DEVICES=0 python main.py \
---model /PATH/TO/LLaMA/llama-7b  \
---epochs 20 --output_dir ./log/llama-7b-w4a4 \
---eval_ppl --wbits 4 --abits 4 --lwc --let \
---tasks piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande
-```
+可选覆盖：
 
-4. reproduce evaluation results of our paper
-
-   1\) download the pretrained OmniQuant parameters you want through [Huggingface](https://huggingface.co/ChenMnZ/OmniQuant/tree/main).
-
-   2\) set epoch as 0 and inference with resume, take LLaMa-7B with W3A16g128 quantization as an example:
-```
-CUDA_VISIBLE_DEVICES=0 python main.py \
---model /PATH/TO/LLaMA/llama-7b  \
---epochs 0 --output_dir ./log/test \
---eval_ppl --wbits 3 --abits 16 --group_size 128 --lwc \
---resume /PATH/TO/Pretrained/Parameters 
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+QWEN15_DIR=/tmp/Qwen1.5-MoE-A2.7B \
+QWEN3_DIR=/tmp/Qwen3-30B-A3B \
+bash scripts/qwen/download_models.sh
 ```
 
-More detailed and optional arguments:
-- `--model`: the local model path or huggingface format.
-- `--wbits`: weight quantization bits.
-- `--abits`: activation quantization bits.
-- `--group_size`: group size of weight quantization. If no set, use per-channel quantization for weight as default.
-- `--lwc`: activate the Learnable Weight Clipping (LWC).
-- `--let`: activate the Learnable Equivalent Transformation (LET).
-- `--lwc_lr`: learning rate of LWC parameters, 1e-2 as default.
-- `--let_lr`: learning rate of LET parameters, 5e-3 as default.
-- `--epochs`: training epochs. You can set it as 0 to evaluate pre-trained OmniQuant checkpoints.
-- `--nsamples`: number of calibration samples, 128 as default.
-- `--eval_ppl`: evaluating the perplexity of quantized models.
-- `--tasks`: evaluating zero-shot tasks.
-- `--resume`: loading pre-trained OmniQuant parameters.
-- `--multigpu`: to inference larger network on multiple GPUs
-- `--real_quant`: real quantization, which can see memory reduce. Note that due to the limitations of AutoGPTQ kernels, the real quantization of weight-only quantization can only lead memory reduction, but with slower inference speed.
-- `--save_dir`: saving the quantization model for further exploration.
+## 报告脚本
 
+脚本分别放在 `scripts/qwen/1.5/` 和 `scripts/qwen/3/`。
 
+| 脚本 | 含义 |
+|-|-|
+| `D0_no_router_ep60.sh`, `D0_no_router_ep100.sh` | 仅 Stage3 baseline，不更新 router |
+| `D1_stage0_stage1_attn_on.sh` | Stage0 开，Stage1 更新 attention，Stage3 不更新 attention |
+| `D2_stage0_stage1_attn_off.sh` | Stage0 开，Stage1 不更新 attention，Stage3 不更新 attention |
+| `D3_stage0_no_stage1.sh` | Stage0 开，Stage1 关闭，Stage3 不更新 attention |
+| `D4_nostage0_stage3_noattn.sh` | Stage0 关，Stage1 不更新 attention，Stage3 不更新 attention |
+| `D5_nostage0_stage3_attn.sh` | Stage0 关，Stage1 不更新 attention，Stage3 更新 attention |
+| `D6_stage0_stage1attnoff_stage3attn.sh` | Stage0 开，Stage1 不更新 attention，Stage3 更新 attention |
+| `D7_stage0_stage1attnon_stage3attn.sh` | Stage0 开，Stage1 更新 attention，Stage3 更新 attention |
+| `D8_noaux.sh` | 在当前最佳配置上关闭 Stage3 aux router loss |
+| `D9_topn8.sh` / `D9_topn12.sh` | 在当前最佳配置上扩大 Stage1 专家覆盖数 |
 
-## Runing Quantized Models with MLC-LLM
-[MLC-LLM](https://github.com/mlc-ai/mlc-llm) offers a universal deployment solution suitable for various language models across
-a wide range of hardware backends, encompassing iPhones, Android phones, and GPUs from NVIDIA, AMD, and Intel. 
+报告中的最佳配置：
 
-We compile the OmniQuant's quantization models through MLC-LLM and offer an out-of-the-box case here. You can see smaller gpu memory usage and inference speedup. Detailed instructions can be found in in [runing_quantized_models_with_mlc_llm.ipynb](./runing_quantized_models_with_mlc_llm.ipynb).
+- Qwen3：`scripts/qwen/3/D5_nostage0_stage3_attn.sh`
+- Qwen1.5：`scripts/qwen/1.5/D7_stage0_stage1attnon_stage3attn.sh`
 
+## 启动方式
 
-Specially, we also deploy the aforementioned two quantized models into mobile phones through MLC-LLM. You can download the Android app by simply clicking the button below:
+单个实验：
 
-[<img src="./imgs/download.png" width="150"/>](https://github.com/OpenGVLab/OmniQuant/releases/download/v0.0.1/omniquant-mlc-llm.apk)
-
-This app includes three models, `LLaMa-2-7B-Chat-Omniquant-W3A16g128asym`, `LLaMa-2-13B-Chat-Omniquant-W3A16g128asym`, and `LLaMa-2-13B-Chat-Omniquant-W2A16g128asym`. They require at least 4.5G, 7.5G, and 6.0G free RAM, respectively. Note that 2bit quantization has worse performance compared to 3bit quantization as shown in our paper. The inclusion of 2-bit quantization is just an extreme exploration about deploy LLM in mobile phones. Currently, this app is in its demo phase and may experience slower response times, so wait patiently for the generation of response. We have tested this app on Redmi Note 12 Turbo (Snapdragon 7+ Gen 2 and 16G RAM), some examples are provided below:
-- LLaMa-2-7B-Chat-Omniquant-W3A16g128asym
-<div style="text-align: center;">
-<img src="./imgs/7b_3bit_android.png" width="500" />
-</div>
-
-- LLaMa-2-13B-Chat-Omniquant-W3A16g128asym
-<div style="text-align: center;">
-<img src="./imgs/13b_3bit_android.png" width="500" />
-</div>
-
-- LLaMa-2-13B-Chat-Omniquant-W2A16g128asym
-<div style="text-align: center;">
-<img src="./imgs/13b_2bit_android.png" width="500" />
-</div>
-
-We also have tested this app on iPhone 14 Pro (A16 Bionic and 6G RAM), some examples are provided below:
-- LLaMa-2-7B-Chat-Omniquant-W3A16g128asym
-<div style="text-align: center;">
-<img src="./imgs/7b_3bit_iphone.png" width="500" />
-</div>
-
-## Results
-- OmniQuant achieve SoTA performance in weight-only quantization
-![weight_only](imgs/weight_only.png)
-- OmniQuant achieve SoTA performance in weight-activation quantization
-![weight_activation](imgs/weight_activation.png)
-- OmniQuant is generalize, also obatins excellent performance in instruction-tuned models with GPT-4 evaluation
-![gpt_4_evaluation](imgs/gpt_4_evaluation.png)
-- MLC-LLM can obtain really speedup and memory saving for W4A16/W3A16/W2A16 quantization
-![mlc_llm](imgs/mlc_llm.png)
-
-## Related Project
-[SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models](https://github.com/mit-han-lab/smoothquant)
-
-[AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration](https://github.com/mit-han-lab/llm-awq)
-
-[GPTQ: Accurate Post-training Compression for Generative Pretrained Transformers](https://github.com/IST-DASLab/gptq)
-
-[RPTQ: Reorder-Based Post-Training Quantization for Large Language Models](https://github.com/hahnyuan/RPTQ4LLM)
-
-[MLC LLM](https://github.com/mlc-ai/mlc-llm)
-
-[AutoGPTQ](https://github.com/PanQiWei/AutoGPTQ)
-
-## Citation
-If you use our OmniQuant approach in your research, please cite our paper:
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/qwen/1.5/D7_stage0_stage1attnon_stage3attn.sh
 ```
-@article{OmniQuant,
-  title={OmniQuant: Omnidirectionally Calibrated Quantization for Large Language Models},
-  author={Shao, Wenqi and Chen,Mengzhao and  Zhang, Zhaoyang and Xu, Peng and Zhao, Lirui and Li, Zhiqian and Zhang, Kaipeng Zhang, and Gao, Peng, and Qiao, Yu, and Luo, Ping},
-  journal={arXiv preprint arXiv:2308.13137},
-  year={2023}
-}
+
+单层 smoke：
+
+```bash
+bash tests/stage0_smoke/run_qwen1p5_stage0_single_layer.sh
 ```
+
+## 常用参数
+
+| 参数 | 作用 |
+|-|-|
+| `--wbits 2 --attn_wbits 4 --abits 16 --group_size 128` | 报告中的量化配置 |
+| `--lwc --lwc_lr 0.026` | Learnable Weight Clipping |
+| `--use_linear_lora --linear_lora_r 32 --linear_lora_alpha 64.0 --linear_lora_lr 0.0002` | 2-bit 实验使用的 Linear LoRA |
+| `--stage0_attn_epochs N` | Stage0 注意力预对齐；`0` 表示关闭 |
+| `--epochs N` | Stage1 专家自监督轮数 |
+| `--no-stage1_update_attn` | Stage1 冻结 attention |
+| `--stage2_enable_calibration --stage2_use_kl --stage2_router_epochs 15` | Stage2 router 校准 |
+| `--k_loss` / `--k_routing` | 报告中 Qwen1.5 为 `20/4`，Qwen3 为 `30/8` |
+| `--quant_routing_top_n` | D9 使用，扩大 Stage1 专家覆盖数 |
+| `--stage3_enable_block_update --stage3_block_update_epochs 40` | Stage3 整块重建 |
+| `--stage3_update_attn --stage3_update_router --stage3_update_expert` | Stage3 允许更新的模块组 |
+| `--stage3_aux_loss --stage3_aux_loss_weight 0.1 --stage3_aux_loss_use_kl` | Stage3 router 辅助损失 |
+| `--max_train_layers 1` | 快速调试；只训练前 N 层，后续层保持全精度 |
+
+## 报告公共配置
+
+- 专家权重：2-bit
+- 注意力权重：4-bit
+- 激活：16-bit
+- `group_size=128`
+- 校准集：`wikitext2`
+- 校准样本数：`128`
+- batch size：`8`
+- Stage2：KL loss，`15` 轮
+- Qwen3：`k_loss=30`，`k_routing=8`
+- Qwen1.5：`k_loss=20`，`k_routing=4`
+
+## 可复现性说明
+
+本分支只做低风险整理，训练计算路径保持不变：
+
+- `main.py` 只移除了调试输出和未使用的调试 import。
+- `quantize/omniquant.py` 只把非有限 reconstruction loss 分支从 `pdb.set_trace()` 改成抛 `FloatingPointError`。
+- 正常 loss 为有限值时，`omniquant.py` 的 loss、backward、GradScaler、optimizer step 路径不变。
+- 脚本里的 HDFS 模型路径改为 Hugging Face repo id，并保留环境变量覆盖。
+
+因此，在模型权重、依赖环境、校准数据、随机种子和脚本参数一致的前提下，可以认为训练效果与报告脚本等同；不承诺 CUDA / AMP 下逐 bit 完全一致。
+
+## 注意事项
+
+- 改代码后优先用 `--max_train_layers 1` 做路径检查，再跑完整实验。
+- `scripts/qwen/logs/` 和 `tests/stage0_smoke/*.log|*.pth` 是运行产物，已被忽略。
+- 如果本机没有模型，先跑 `scripts/qwen/download_models.sh` 或设置本地模型路径环境变量。

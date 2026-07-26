@@ -1,17 +1,4 @@
 import os
-
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-os.environ["windows_host"] = "http://child-prc.intel.com"
-os.environ["HTTP_PROXY"] = f"{os.environ['windows_host']}:913"
-os.environ["ALL_PROXY"] = f"{os.environ['windows_host']}:913"
-os.environ["http_proxy"] = os.environ["HTTP_PROXY"]
-os.environ["HTTPS_PROXY"] = os.environ["HTTP_PROXY"]
-os.environ["https_proxy"] = os.environ["HTTP_PROXY"]
-os.environ["no_proxy"] = "localhost,127.0.0.1"
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
-
-import sys
 import random
 from numbers import Number
 import numpy as np
@@ -20,7 +7,6 @@ import torch
 import time
 from datautils import get_loaders
 from lm_eval import evaluator
-from pprint import pprint
 from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
 import torch.nn as nn
 from quantize.omniquant import omniquant
@@ -34,8 +20,6 @@ from accelerate.utils import get_balanced_memory
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
 from quantize.int_linear import QuantLinear
-
-import pdb
 
 torch.backends.cudnn.benchmark = True
 
@@ -231,7 +215,7 @@ def evaluate(lm, args, logger):
         if eval_batch_size is None:
             eval_batch_size = 'auto'
 
-        print(f"Initializing HFLM with batch_size={eval_batch_size}...")
+        logger.info(f"Initializing HFLM with batch_size={eval_batch_size}...")
 
         hflm = HFLM(pretrained=lm.model, tokenizer=lm.tokenizer, batch_size=eval_batch_size)
 
@@ -248,7 +232,6 @@ def evaluate(lm, args, logger):
             metric_vals[task] = round(result.get('acc_norm,none', result.get('acc,none', 0)), 4)
 
         logger.info(f"Task Results: {metric_vals}")
-        pprint(metric_vals)
         results.update(metric_vals)
 
         # === 4. CSV 保存逻辑 (仅在跑了 Task 时触发) ===
@@ -396,8 +379,6 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=None,
                         help="Enable gradient clipping with the provided max norm; disabled when omitted")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--attn_epochs", type=int, default=None,
-                        help="Base epoch count for decoupled attention training; defaults to --epochs and increases by 1 every 2 layers")
     parser.add_argument("--let", default=False, action="store_true",
                         help="activate learnable equivalent transformation")
     parser.add_argument("--lwc", default=False, action="store_true", help="activate learnable weight clipping")
@@ -450,7 +431,7 @@ def main():
                         help="Enable LoRA on QuantLinear layers during block-wise quantization")
     parser.add_argument("--linear_lora_r", type=int, default=16,
                         help="LoRA rank for QuantLinear layers")
-    parser.add_argument("--linear_lora_alpha", type=float, default=16.0,
+    parser.add_argument("--linear_lora_alpha", type=float, default=32.0,
                         help="LoRA alpha for QuantLinear layers")
     parser.add_argument("--linear_lora_lr", type=float, default=1e-4,
                         help="Learning rate for QuantLinear LoRA parameters")
@@ -462,11 +443,22 @@ def main():
                         help="Learning rate for router calibration (default 1e-2, higher than LWC)")
     parser.add_argument("--router_epochs", type=int, default=5,
                         help="Number of epochs for router calibration per layer")
-    parser.add_argument("--enable_expert_shift_calibration", default=False, action="store_true",
+    # Stage0 arguments (decoupled MoE): attention-only alignment before expert/router training
+    parser.add_argument("--stage0_attn_epochs", type=int, default=0,
+                        help="Stage0 attention-only alignment epochs (decoupled MoE). 0 disables stage0")
+    # Stage1 arguments (decoupled MoE): expert self-supervision (epochs controlled by --epochs)
+    parser.add_argument("--stage1_update_attn", default=True, action=argparse.BooleanOptionalAction,
+                        help="Whether stage1 expert self-supervision also updates attention params (use --no-stage1_update_attn to freeze attn in stage1)")
+    # Stage2 arguments (decoupled MoE): expert-shift router calibration
+    parser.add_argument("--stage2_enable_calibration", default=False, action="store_true",
                         help="Enable the decoupled stage2 expert-shift calibration phase before block-wise free routing")
-    parser.add_argument("--expert_shift_calibration_update_attn", default=False, action="store_true",
+    parser.add_argument("--stage2_router_lr", type=float, default=1e-2,
+                        help="Learning rate for stage2 expert-shift router calibration")
+    parser.add_argument("--stage2_router_epochs", type=int, default=5,
+                        help="Number of epochs for stage2 expert-shift router calibration per layer")
+    parser.add_argument("--stage2_update_attn", default=False, action="store_true",
                         help="Allow stage2 expert-shift calibration to update attention LWC/Linear-LoRA parameters")
-    parser.add_argument("--expert_shift_calibration_use_kl", default=False, action="store_true",
+    parser.add_argument("--stage2_use_kl", default=False, action="store_true",
                         help="Use teacher-top-k KL divergence instead of TopK-MSE during stage2 expert-shift calibration")
     parser.add_argument("--k_loss", type=int, default=20,
                         help="TopK used by router calibration losses and expert-shift label caching")
@@ -478,66 +470,69 @@ def main():
                         help="Weight each token-expert self-supervision loss by the normalized FP16 router probability")
     parser.add_argument("--block_eval_interval", type=int, default=0,
                         help="Run student-only block-wise evaluation every N MoE epochs; disabled when < 1")
-    parser.add_argument("--enable_block_loss_update", default=False, action="store_true",
+    # Stage3 arguments (decoupled MoE): block-wise free-routing student-loss update
+    parser.add_argument("--stage3_enable_block_update", default=False, action="store_true",
                         help="Enable post-MoE student-loss block-wise update stage (pre-eval -> update -> post-eval)")
-    parser.add_argument("--block_update_epochs", type=int, default=1,
+    parser.add_argument("--stage3_block_update_epochs", type=int, default=1,
                         help="Epoch count for post-MoE block-wise update stage")
-    parser.add_argument("--block_update_attn", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update attention LWC/LoRA parameters")
-    parser.add_argument("--block_update_router", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update router/shared-gate parameters")
-    parser.add_argument("--block_update_expert", default=False, action="store_true",
-                        help="Allow student-loss block update stage to update experts parameters")
-    parser.add_argument("--block_aux_loss", default=False, action="store_true",
-                        help="Enable router auxiliary loss to keep quant router close to FP16 routing")
-    parser.add_argument("--block_aux_loss_weight", type=float, default=0.1,
-                        help="Weight for router auxiliary loss in block-wise update stage")
+    parser.add_argument("--stage3_update_attn", default=False, action="store_true",
+                        help="Allow stage3 student-loss block update stage to update attention LWC/LoRA parameters")
+    parser.add_argument("--stage3_update_router", default=False, action="store_true",
+                        help="Allow stage3 student-loss block update stage to update router/shared-gate parameters")
+    parser.add_argument("--stage3_update_expert", default=False, action="store_true",
+                        help="Allow stage3 student-loss block update stage to update experts parameters")
+    parser.add_argument("--stage3_aux_loss", default=False, action="store_true",
+                        help="Enable stage3 router auxiliary loss to keep quant router close to FP16 routing")
+    parser.add_argument("--stage3_aux_loss_weight", type=float, default=0.1,
+                        help="Weight for stage3 router auxiliary loss in block-wise update stage")
+    parser.add_argument("--stage3_aux_loss_use_kl", default=False, action="store_true",
+                        help="Use TopK-KL (reuse Stage2 logic) for stage3 router auxiliary loss instead of TopK-MSE")
     parser.add_argument("--max_train_layers", type=int, default=-1,
                         help="Quantize/train at most the first N layers; later layers stay full precision. Use -1 for all layers, 1 for first block only")
 
     args = parser.parse_args()
-    if args.attn_epochs is None:
-        args.attn_epochs = args.epochs
     if args.epochs < 0:
         raise ValueError("--epochs must be non-negative")
-    if args.attn_epochs < 0:
-        raise ValueError("--attn_epochs must be non-negative")
     if args.max_grad_norm is not None and args.max_grad_norm <= 0:
         raise ValueError("--max_grad_norm must be positive when provided")
-    if args.block_update_epochs < 0:
-        raise ValueError("--block_update_epochs must be non-negative")
-    if args.block_aux_loss_weight < 0:
-        raise ValueError("--block_aux_loss_weight must be non-negative")
+    if args.stage3_block_update_epochs < 0:
+        raise ValueError("--stage3_block_update_epochs must be non-negative")
+    if args.stage3_aux_loss_weight < 0:
+        raise ValueError("--stage3_aux_loss_weight must be non-negative")
     if args.max_train_layers < -1:
         raise ValueError("--max_train_layers must be -1 or a non-negative integer")
-    if args.enable_expert_shift_calibration and args.router_epochs <= 0:
-        raise ValueError("--router_epochs must be positive when --enable_expert_shift_calibration is enabled")
+    if args.stage0_attn_epochs < 0:
+        raise ValueError("--stage0_attn_epochs must be non-negative")
+    if args.stage2_enable_calibration and args.stage2_router_epochs <= 0:
+        raise ValueError("--stage2_router_epochs must be positive when --stage2_enable_calibration is enabled")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
 
     # check
-    if getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0:
+    if getattr(args, "stage3_enable_block_update", False) and getattr(args, "stage3_block_update_epochs", 0) > 0:
         has_any_trainable_mechanism = True
-    elif getattr(args, "enable_expert_shift_calibration", False) and getattr(args, "router_epochs", 0) > 0:
+    elif getattr(args, "stage2_enable_calibration", False) and getattr(args, "stage2_router_epochs", 0) > 0:
         has_any_trainable_mechanism = True
-    elif args.epochs > 0 or args.attn_epochs > 0:
+    elif getattr(args, "stage0_attn_epochs", 0) > 0:
+        has_any_trainable_mechanism = True
+    elif args.epochs > 0:
         has_any_trainable_mechanism = any([
             args.lwc,
             args.let,
             args.use_linear_lora,
             args.train_gate_lora,
             args.train_shared_gate,
-            args.enable_block_loss_update,
+            args.stage3_enable_block_update,
             args.calibrate_router,
-            args.enable_expert_shift_calibration,
+            args.stage2_enable_calibration,
         ])
         if not has_any_trainable_mechanism:
             raise ValueError(
                 "Training epochs are set, but no trainable mechanism is enabled. "
                 "Enable at least one of --lwc, --let, --use_linear_lora, --train_gate_lora, "
-                "--train_shared_gate, --enable_block_loss_update, --enable_expert_shift_calibration, or --calibrate_router."
+                "--train_shared_gate, --stage3_enable_block_update, --stage2_enable_calibration, or --calibrate_router."
             )
 
     if args.use_linear_lora and args.let:
@@ -549,11 +544,11 @@ def main():
     if args.use_linear_lora and args.linear_lora_r <= 0:
         raise ValueError("--linear_lora_r must be positive when --use_linear_lora is enabled")
 
-    if args.expert_shift_calibration_update_attn and not args.enable_expert_shift_calibration:
-        raise ValueError("--expert_shift_calibration_update_attn requires --enable_expert_shift_calibration")
+    if args.stage2_update_attn and not args.stage2_enable_calibration:
+        raise ValueError("--stage2_update_attn requires --stage2_enable_calibration")
 
-    if args.expert_shift_calibration_use_kl and not args.enable_expert_shift_calibration:
-        raise ValueError("--expert_shift_calibration_use_kl requires --enable_expert_shift_calibration")
+    if args.stage2_use_kl and not args.stage2_enable_calibration:
+        raise ValueError("--stage2_use_kl requires --stage2_enable_calibration")
 
     effective_net_name = (args.net or args.model.split('/')[-1]).lower()
     if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.let:
@@ -564,8 +559,8 @@ def main():
         raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --train_shared_gate without an explicit shared-gate loss")
     if ("qwen" in effective_net_name or "deepseek" in effective_net_name) and args.calibrate_router:
         raise ValueError("Decoupled Qwen/DeepSeek MoE training does not support --calibrate_router")
-    if args.enable_expert_shift_calibration and not ("qwen" in effective_net_name or "deepseek" in effective_net_name):
-        raise ValueError("--enable_expert_shift_calibration is currently only supported for decoupled Qwen/DeepSeek MoE models")
+    if args.stage2_enable_calibration and not ("qwen" in effective_net_name or "deepseek" in effective_net_name):
+        raise ValueError("--stage2_enable_calibration is currently only supported for decoupled Qwen/DeepSeek MoE models")
 
     if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16 and args.abits >= 8):
         args.deactive_amp = True
@@ -586,12 +581,14 @@ def main():
     logger.info("Training Configuration Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
-    logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
-    logger.info(f"  Expert Shift Calibration  : {'ON' if args.enable_expert_shift_calibration else 'OFF'}"
-                + (f"  (router_lr={args.router_lr}, router_epochs={args.router_epochs}, loss={'KL' if args.expert_shift_calibration_use_kl else 'MSE'})" if args.enable_expert_shift_calibration else ""))
-    logger.info(f"  Stage2 Update Attention   : {'ON' if args.expert_shift_calibration_update_attn else 'OFF'}")
+    logger.info(f"  Stage0 Attn-Only Align    : {'ON' if args.stage0_attn_epochs > 0 else 'OFF'}"
+                + (f"  (epochs={args.stage0_attn_epochs}, lr follows attn groups)" if args.stage0_attn_epochs > 0 else ""))
+    logger.info(f"  Stage1 Update Attention   : {'ON' if args.stage1_update_attn else 'OFF'}")
+    logger.info(f"  Stage2 Expert Shift Calib : {'ON' if args.stage2_enable_calibration else 'OFF'}"
+                + (f"  (stage2_router_lr={args.stage2_router_lr}, stage2_router_epochs={args.stage2_router_epochs}, loss={'KL' if args.stage2_use_kl else 'MSE'})" if args.stage2_enable_calibration else ""))
+    logger.info(f"  Stage2 Update Attention   : {'ON' if args.stage2_update_attn else 'OFF'}")
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
     logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"
@@ -601,13 +598,13 @@ def main():
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
-    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
-                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
-    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
-    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
-    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
-    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
-                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Stage3 Block Update Stage : {'ON' if args.stage3_enable_block_update else 'OFF'}"
+                + (f"  (epochs={args.stage3_block_update_epochs}, lr follows existing groups)" if args.stage3_enable_block_update else ""))
+    logger.info(f"  Stage3 Update Attention   : {'ON' if args.stage3_update_attn else 'OFF'}")
+    logger.info(f"  Stage3 Update Router      : {'ON' if args.stage3_update_router else 'OFF'}")
+    logger.info(f"  Stage3 Update Expert      : {'ON' if args.stage3_update_expert else 'OFF'}")
+    logger.info(f"  Stage3 Aux Router Loss    : {'ON' if args.stage3_aux_loss else 'OFF'}"
+                + (f"  (weight={args.stage3_aux_loss_weight})" if args.stage3_aux_loss else ""))
     logger.info(f"  Max Quantized Layers      : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info("=" * 60)
 
@@ -761,12 +758,14 @@ def main():
     logger.info("Final Summary")
     logger.info("=" * 60)
     logger.info(f"  Total Epochs              : {args.epochs}")
-    logger.info(f"  Attention Epochs Base     : {args.attn_epochs}")
     logger.info(f"  Router Calibration        : {'ON' if args.calibrate_router else 'OFF'}"
                 + (f"  (lr={args.router_lr}, router_epochs={args.router_epochs})" if args.calibrate_router else ""))
-    logger.info(f"  Expert Shift Calibration  : {'ON' if args.enable_expert_shift_calibration else 'OFF'}"
-                + (f"  (router_lr={args.router_lr}, router_epochs={args.router_epochs}, loss={'KL' if args.expert_shift_calibration_use_kl else 'MSE'})" if args.enable_expert_shift_calibration else ""))
-    logger.info(f"  Stage2 Update Attention   : {'ON' if args.expert_shift_calibration_update_attn else 'OFF'}")
+    logger.info(f"  Stage0 Attn-Only Align    : {'ON' if args.stage0_attn_epochs > 0 else 'OFF'}"
+                + (f"  (epochs={args.stage0_attn_epochs}, lr follows attn groups)" if args.stage0_attn_epochs > 0 else ""))
+    logger.info(f"  Stage1 Update Attention   : {'ON' if args.stage1_update_attn else 'OFF'}")
+    logger.info(f"  Stage2 Expert Shift Calib : {'ON' if args.stage2_enable_calibration else 'OFF'}"
+                + (f"  (stage2_router_lr={args.stage2_router_lr}, stage2_router_epochs={args.stage2_router_epochs}, loss={'KL' if args.stage2_use_kl else 'MSE'})" if args.stage2_enable_calibration else ""))
+    logger.info(f"  Stage2 Update Attention   : {'ON' if args.stage2_update_attn else 'OFF'}")
     logger.info(f"  Train Gate LoRA           : {'ON' if args.train_gate_lora else 'OFF'}"
                 + (f"  (lr={args.gate_lora_lr})" if args.train_gate_lora else ""))
     logger.info(f"  Linear Quant LoRA         : {'ON' if args.use_linear_lora else 'OFF'}"
@@ -776,13 +775,13 @@ def main():
     logger.info(f"  MoE Quant Routing Top-N   : {args.quant_routing_top_n if args.quant_routing_top_n is not None else 'layer top-k'}")
     logger.info(f"  Router Weight In Loss     : {'ON' if args.use_router_weight_in_loss else 'OFF'}")
     logger.info(f"  Block Eval Interval       : {args.block_eval_interval} ({'OFF' if args.block_eval_interval < 1 else 'ON'})")
-    logger.info(f"  Block Loss Update Stage   : {'ON' if args.enable_block_loss_update else 'OFF'}"
-                + (f"  (epochs={args.block_update_epochs}, lr follows existing groups)" if args.enable_block_loss_update else ""))
-    logger.info(f"  Block Update Attention    : {'ON' if args.block_update_attn else 'OFF'}")
-    logger.info(f"  Block Update Router       : {'ON' if args.block_update_router else 'OFF'}")
-    logger.info(f"  Block Update Expert       : {'ON' if args.block_update_expert else 'OFF'}")
-    logger.info(f"  Block Aux Router Loss     : {'ON' if args.block_aux_loss else 'OFF'}"
-                + (f"  (weight={args.block_aux_loss_weight})" if args.block_aux_loss else ""))
+    logger.info(f"  Stage3 Block Update Stage : {'ON' if args.stage3_enable_block_update else 'OFF'}"
+                + (f"  (epochs={args.stage3_block_update_epochs}, lr follows existing groups)" if args.stage3_enable_block_update else ""))
+    logger.info(f"  Stage3 Update Attention   : {'ON' if args.stage3_update_attn else 'OFF'}")
+    logger.info(f"  Stage3 Update Router      : {'ON' if args.stage3_update_router else 'OFF'}")
+    logger.info(f"  Stage3 Update Expert      : {'ON' if args.stage3_update_expert else 'OFF'}")
+    logger.info(f"  Stage3 Aux Router Loss    : {'ON' if args.stage3_aux_loss else 'OFF'}"
+                + (f"  (weight={args.stage3_aux_loss_weight})" if args.stage3_aux_loss else ""))
     logger.info(f"  Max Quantized Layers      : {args.max_train_layers if args.max_train_layers >= 0 else 'ALL'}")
     logger.info(f"  Final Loss                : {final_loss if final_loss is not None else 'N/A'}")
     # PPL results
@@ -807,5 +806,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print(sys.argv)
     main()

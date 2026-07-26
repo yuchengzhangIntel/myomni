@@ -10,7 +10,6 @@ import copy
 import math
 import utils
 import os
-import pdb
 import gc
 from quantize.utils import (
     let_parameters, lwc_parameters, get_omni_parameters,
@@ -192,7 +191,7 @@ def build_block_update_param_groups(module, args):
     selected_params = []
     param_groups = []
 
-    if getattr(args, "block_update_attn", False):
+    if getattr(args, "stage3_update_attn", False):
         attn_lwc_params, attn_lora_params = collect_stage_parameters(
             module,
             attention_prefixes,
@@ -205,7 +204,7 @@ def build_block_update_param_groups(module, args):
             param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
             selected_params.extend(attn_lora_params)
 
-    if getattr(args, "block_update_router", False):
+    if getattr(args, "stage3_update_router", False):
         router_params, shared_gate_params = collect_router_and_shared_gate_parameters(module)
         if router_params:
             param_groups.append({"params": router_params, "lr": args.gate_lora_lr, "weight_decay": args.wd})
@@ -214,7 +213,7 @@ def build_block_update_param_groups(module, args):
             param_groups.append({"params": shared_gate_params, "lr": args.shared_gate_lr, "weight_decay": args.wd})
             selected_params.extend(shared_gate_params)
 
-    if getattr(args, "block_update_expert", False):
+    if getattr(args, "stage3_update_expert", False):
         moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
         moe_lwc_params, moe_lora_params = collect_stage_parameters(
             module,
@@ -238,10 +237,10 @@ def build_router_calibration_param_groups(module, args):
 
     router_params = collect_router_gate_parameters(module)
     if router_params:
-        param_groups.append({"params": router_params, "lr": args.router_lr, "weight_decay": 0})
+        param_groups.append({"params": router_params, "lr": args.stage2_router_lr, "weight_decay": 0})
         selected_params.extend(router_params)
 
-    if getattr(args, "expert_shift_calibration_update_attn", False):
+    if getattr(args, "stage2_update_attn", False):
         attn_lwc_params, attn_lora_params = collect_stage_parameters(
             module,
             attention_prefixes,
@@ -308,11 +307,11 @@ DECOUPLED_EXPERT_SHIFT_PHASES = (
 
 def should_track_stage3_expert_shift(args):
     return bool(
-        getattr(args, "enable_block_loss_update", False)
-        and max(0, int(getattr(args, "block_update_epochs", 1))) > 0
+        getattr(args, "stage3_enable_block_update", False)
+        and max(0, int(getattr(args, "stage3_block_update_epochs", 1))) > 0
         and (
-            getattr(args, "block_update_router", False)
-            or getattr(args, "block_update_attn", False)
+            getattr(args, "stage3_update_router", False)
+            or getattr(args, "stage3_update_attn", False)
         )
     )
 
@@ -493,12 +492,12 @@ def train_expert_shift_calibration_stage(
     traincast,
     use_grad_scaler,
 ):
-    if not getattr(args, "enable_expert_shift_calibration", False):
+    if not getattr(args, "stage2_enable_calibration", False):
         return None
 
-    router_epochs = max(0, int(getattr(args, "router_epochs", 0)))
-    if router_epochs <= 0:
-        logger.warning(f"[ExpertCalib] Layer {layer_idx}: router_epochs <= 0, skipping stage2")
+    stage2_router_epochs = max(0, int(getattr(args, "stage2_router_epochs", 0)))
+    if stage2_router_epochs <= 0:
+        logger.warning(f"[ExpertCalib] Layer {layer_idx}: stage2_router_epochs <= 0, skipping stage2")
         return None
 
     if teacher_router_labels is None:
@@ -519,17 +518,17 @@ def train_expert_shift_calibration_stage(
     calibration_optimizer = torch.optim.AdamW(param_groups, weight_decay=0)
     calibration_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
     clip_grad_max_norm = getattr(args, "max_grad_norm", None)
-    use_kl_loss = getattr(args, "expert_shift_calibration_use_kl", False)
+    use_kl_loss = getattr(args, "stage2_use_kl", False)
     loss_name = "TopK-KL" if use_kl_loss else "TopK-MSE"
     final_stage_loss = None
 
     logger.info(
-        f"[ExpertCalib] Layer {layer_idx}: calibrating router for {router_epochs} epochs with {loss_name}"
-        + (" and attention updates" if getattr(args, "expert_shift_calibration_update_attn", False) else "")
+        f"[ExpertCalib] Layer {layer_idx}: calibrating router for {stage2_router_epochs} epochs with {loss_name}"
+        + (" and attention updates" if getattr(args, "stage2_update_attn", False) else "")
     )
 
     try:
-        for epoch in range(router_epochs):
+        for epoch in range(stage2_router_epochs):
             loss_list = []
             norm_list = []
             skipped_batches = 0
@@ -686,13 +685,6 @@ def resolve_quant_routing_top_n(moe_module, requested_top_n):
     return requested_top_n
 
 
-def get_attention_epochs(args, layer_idx=None):
-    base_attn_epochs = getattr(args, "attn_epochs", args.epochs)
-    if base_attn_epochs <= 0 or layer_idx is None:
-        return base_attn_epochs
-    return base_attn_epochs + max(layer_idx, 0) // 2
-
-
 def should_keep_layer_full_precision(layer_idx, max_train_layers):
     return max_train_layers >= 0 and layer_idx >= max_train_layers
 
@@ -801,6 +793,149 @@ def compute_moe_self_supervision_loss(
     return torch.stack(loss_terms).sum()
 
 
+def train_stage0_attention_alignment(
+    layer,
+    qlayer,
+    args,
+    logger,
+    layer_idx,
+    fp_inps,
+    quant_inps,
+    layer_kwargs,
+    attention_mask_batch,
+    attention_mask,
+    position_ids,
+    traincast,
+    use_grad_scaler,
+):
+    """
+    Stage0: attention-only alignment before any expert/router training.
+
+    Teacher = FP attention sublayer output (post-residual, post-layernorm MLP
+    input) computed from the full-precision layer on FP inputs. Student = the
+    quantized attention sublayer on quantized inputs. Only attention LWC/LoRA
+    params are updated so attention can absorb its own quantization error before
+    the experts start moving, giving later stages a cleaner starting point.
+    """
+    stage0_epochs = max(0, int(getattr(args, "stage0_attn_epochs", 0)))
+    if stage0_epochs <= 0:
+        return None
+
+    attn_lwc_params, attn_lora_params = collect_stage_parameters(
+        qlayer,
+        ("self_attn.",),
+        include_linear_lora=getattr(args, "use_linear_lora", False),
+    )
+    selected_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
+    if not selected_params:
+        logger.warning(f"[Stage0] Layer {layer_idx}: no attention parameters selected, skipping stage0")
+        return None
+
+    loss_func = torch.nn.MSELoss()
+    clip_grad_max_norm = getattr(args, "max_grad_norm", None)
+
+    # Build FP teacher targets: MLP inputs (attn sublayer output) of the FP layer.
+    fp_mlp_targets = torch.zeros_like(fp_inps)
+    set_quant_state(qlayer, weight_quant=False, act_quant=False)
+    with torch.no_grad():
+        with traincast():
+            for sample_idx in range(args.nsamples):
+                _, _, mlp_inputs = compute_mlp_inputs(
+                    layer,
+                    fp_inps[sample_idx].unsqueeze(0),
+                    layer_kwargs,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                fp_mlp_targets[sample_idx] = mlp_inputs
+
+    original_requires_grad = {id(param): param.requires_grad for param in qlayer.parameters()}
+    for param in qlayer.parameters():
+        param.requires_grad = False
+    for param in selected_params:
+        param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0},
+            {"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd},
+        ],
+        weight_decay=0,
+    )
+    scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
+    final_stage_loss = None
+
+    logger.info(f"[Stage0] Layer {layer_idx}: attention-only alignment for {stage0_epochs} epochs")
+
+    set_quant_state(qlayer, weight_quant=False, act_quant=True)
+    try:
+        for epoch in range(stage0_epochs):
+            loss_list = []
+            norm_list = []
+            skipped_batches = 0
+            for start in range(0, args.nsamples, args.batch_size):
+                end = min(start + args.batch_size, args.nsamples)
+                batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
+                optimizer.zero_grad()
+                try:
+                    with traincast():
+                        smooth_and_quant_temporary(qlayer, args, isllama=True)
+                        _, _, student_mlp_inputs = compute_mlp_inputs(
+                            qlayer,
+                            quant_inps[start:end],
+                            layer_kwargs,
+                            attention_mask=batch_attention_mask,
+                            position_ids=position_ids,
+                        )
+                        loss = loss_func(fp_mlp_targets[start:end], student_mlp_inputs)
+                    if not torch.isfinite(loss.detach()):
+                        skipped_batches += 1
+                        logger.warning(
+                            f"[SkipBatch] Stage0 layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
+                            "non-finite attention alignment loss"
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    norm, skipped_update, skip_reason = scaler(
+                        loss,
+                        optimizer,
+                        clip_grad=clip_grad_max_norm,
+                        parameters=selected_params,
+                        return_metadata=True,
+                    )
+                    if skipped_update:
+                        skipped_batches += 1
+                        logger.warning(
+                            f"[SkipBatch] Stage0 layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
+                            f"optimizer update skipped due to {skip_reason}"
+                        )
+                        continue
+                    if norm is None:
+                        norm = torch.tensor(0.0, device=quant_inps.device)
+                    loss_list.append(loss.detach().cpu())
+                    norm_list.append(norm.cpu())
+                finally:
+                    clear_temp_variable(qlayer)
+
+            if not loss_list:
+                logger.warning(f"[Stage0] Layer {layer_idx} epoch {epoch}: all batches skipped")
+                continue
+
+            loss_mean = torch.stack(loss_list).mean()
+            norm_mean = torch.stack(norm_list).mean()
+            logger.info(
+                f"[Stage0] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean} skipped:{skipped_batches}"
+            )
+            final_stage_loss = loss_mean.item()
+    finally:
+        del optimizer
+        clear_temp_variable(qlayer)
+        for param in qlayer.parameters():
+            param.requires_grad = original_requires_grad[id(param)]
+
+    return final_stage_loss
+
+
 def train_decoupled_moe_layer(
     layer,
     qlayer,
@@ -832,37 +967,36 @@ def train_decoupled_moe_layer(
     diagnostics = {"expert_shift": {}}
     loss_func = torch.nn.MSELoss()
     clip_grad_max_norm = getattr(args, "max_grad_norm", None)
-    attn_epochs = get_attention_epochs(args, layer_idx)
     attention_prefixes = ("self_attn.",)
     moe_prefixes = ("mlp.experts.", "mlp.shared_expert.", "mlp.shared_experts.")
-    update_stage_enabled = getattr(args, "enable_block_loss_update", False)
-    update_stage_epochs = max(0, int(getattr(args, "block_update_epochs", 1)))
-    block_aux_enabled = getattr(args, "block_aux_loss", False)
-    block_aux_weight = float(getattr(args, "block_aux_loss_weight", 0.1))
-    stage2_enabled = getattr(args, "enable_expert_shift_calibration", False)
+    update_stage_enabled = getattr(args, "stage3_enable_block_update", False)
+    update_stage_epochs = max(0, int(getattr(args, "stage3_block_update_epochs", 1)))
+    block_aux_enabled = getattr(args, "stage3_aux_loss", False)
+    block_aux_weight = float(getattr(args, "stage3_aux_loss_weight", 0.1))
+    stage2_enabled = getattr(args, "stage2_enable_calibration", False)
     stage3_shift_enabled = should_track_stage3_expert_shift(args)
+    stage0_attn_epochs = max(0, int(getattr(args, "stage0_attn_epochs", 0)))
+    stage1_update_attn = getattr(args, "stage1_update_attn", True)
 
     attn_lwc_params, attn_lora_params = collect_stage_parameters(
         qlayer,
         attention_prefixes,
         include_linear_lora=getattr(args, "use_linear_lora", False),
     )
-    attn_param_groups = []
-    if attn_lwc_params:
-        attn_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if attn_lora_params:
-        attn_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
 
     moe_lwc_params, moe_lora_params = collect_stage_parameters(
         qlayer,
         moe_prefixes,
         include_linear_lora=getattr(args, "use_linear_lora", False),
     )
-    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params)
+    # Stage1 optionally folds attention params into the joint expert+attn update.
+    # When --no-stage1_update_attn is set, attention is frozen during stage1 so it
+    # can be aligned separately (e.g. in stage0) without chasing the moving experts.
+    joint_moe_attn_params = dedupe_parameters(attn_lwc_params + attn_lora_params) if stage1_update_attn else []
     moe_param_groups = []
-    if attn_lwc_params:
+    if stage1_update_attn and attn_lwc_params:
         moe_param_groups.append({"params": attn_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
-    if attn_lora_params:
+    if stage1_update_attn and attn_lora_params:
         moe_param_groups.append({"params": attn_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
     if moe_lwc_params:
         moe_param_groups.append({"params": moe_lwc_params, "lr": args.lwc_lr, "weight_decay": 0})
@@ -870,8 +1004,7 @@ def train_decoupled_moe_layer(
         moe_param_groups.append({"params": moe_lora_params, "lr": args.linear_lora_lr, "weight_decay": args.wd})
 
     stage1_moe_enabled = bool(moe_param_groups) and args.epochs > 0
-    stage1_attn_enabled = bool(attn_param_groups) and attn_epochs > 0
-    stage1_training_enabled = stage1_attn_enabled or stage1_moe_enabled
+    stage1_training_enabled = stage1_moe_enabled
     expert_shift_monitor_enabled = stage1_training_enabled or stage2_enabled or stage3_shift_enabled
 
     routing_top_k = get_moe_top_k(layer.mlp)
@@ -905,6 +1038,25 @@ def train_decoupled_moe_layer(
     if stage2_enabled and teacher_router_labels is None:
         logger.warning(f"[ExpertCalib] Layer {layer_idx}: teacher router labels unavailable, stage2 will be skipped")
 
+    if stage0_attn_epochs > 0:
+        stage0_loss = train_stage0_attention_alignment(
+            layer,
+            qlayer,
+            args,
+            logger,
+            layer_idx,
+            fp_inps,
+            quant_inps,
+            layer_kwargs,
+            attention_mask_batch,
+            attention_mask,
+            position_ids,
+            traincast,
+            use_grad_scaler,
+        )
+        if stage0_loss is not None:
+            final_stage_loss = stage0_loss
+
     if stage1_training_enabled:
         stage1_pre_metrics = compute_quantized_expert_shift_metrics(
             qlayer,
@@ -921,78 +1073,6 @@ def train_decoupled_moe_layer(
         )
         if stage1_pre_metrics is not None:
             diagnostics["expert_shift"]["stage1_pre"] = stage1_pre_metrics
-
-    if attn_param_groups and attn_epochs > 0:
-        logger.info(f"[Decoupled Attention] Layer {layer_idx}: training attention quantization for {attn_epochs} epochs")
-        attn_optimizer = torch.optim.AdamW(attn_param_groups, weight_decay=0)
-        attn_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-        attn_clip_params = attn_lwc_params + attn_lora_params
-        for epoch in range(attn_epochs):
-            loss_list = []
-            norm_list = []
-            skipped_batches = 0
-            for start in range(0, args.nsamples, args.batch_size):
-                end = min(start + args.batch_size, args.nsamples)
-                batch_attention_mask = attention_mask_batch[: end - start] if attention_mask_batch is not None else None
-                attn_optimizer.zero_grad()
-                try:
-                    with torch.no_grad():
-                        with traincast():
-                            teacher_attn_outputs = compute_attention_outputs(
-                                layer,
-                                fp_inps[start:end],
-                                layer_kwargs,
-                                attention_mask=batch_attention_mask,
-                                position_ids=position_ids,
-                            )
-                    with traincast():
-                        smooth_and_quant_temporary(qlayer, args, isllama=True)
-                        student_attn_outputs = compute_attention_outputs(
-                            qlayer,
-                            quant_inps[start:end],
-                            layer_kwargs,
-                            attention_mask=batch_attention_mask,
-                            position_ids=position_ids,
-                        )
-                        loss = loss_func(student_attn_outputs, teacher_attn_outputs)
-                    norm, skipped_update, skip_reason = attn_scaler(
-                        loss,
-                        attn_optimizer,
-                        clip_grad=clip_grad_max_norm,
-                        parameters=attn_clip_params,
-                        return_metadata=True,
-                    )
-                    if skipped_update:
-                        skipped_batches += 1
-                        logger.warning(
-                            f"[SkipBatch] Decoupled Attention layer {layer_idx} epoch {epoch} batch {start // args.batch_size}: "
-                            f"optimizer update skipped due to {skip_reason}"
-                        )
-                        continue
-                    if norm is None:
-                        norm = torch.tensor(0.0, device=quant_inps.device)
-                    norm = norm.cpu()
-                    if clip_grad_max_norm is not None and float(norm.item()) > clip_grad_max_norm:
-                        logger.info(
-                            f"[GradClip] Decoupled Attention layer {layer_idx} epoch {epoch} "
-                            f"batch {start // args.batch_size}: grad_norm={float(norm.item()):.6g} > max_norm={clip_grad_max_norm:.6g}"
-                        )
-                    loss_list.append(loss.detach().cpu())
-                    norm_list.append(norm)
-                finally:
-                    clear_temp_variable(qlayer)
-
-            if not loss_list:
-                logger.warning(f"[Decoupled Attention] Layer {layer_idx} epoch {epoch}: all batches skipped")
-                continue
-
-            loss_mean = torch.stack(loss_list).mean()
-            norm_mean = torch.stack(norm_list).mean()
-            logger.info(
-                f"[Decoupled Attention] Layer {layer_idx} epoch {epoch} loss:{loss_mean} norm:{norm_mean} skipped:{skipped_batches}"
-            )
-            final_stage_loss = loss_mean.item()
-        del attn_optimizer
 
     fp_block_targets, fp_block_targets_aug = compute_fp_block_targets(
         layer,
@@ -1028,7 +1108,8 @@ def train_decoupled_moe_layer(
         )
         moe_optimizer = torch.optim.AdamW(moe_param_groups, weight_decay=0)
         moe_scaler = utils.NativeScalerWithGradNormCount(use_grad_scaler=use_grad_scaler)
-        moe_clip_params = dedupe_parameters(attn_lwc_params + attn_lora_params + moe_lwc_params + moe_lora_params)
+        stage1_attn_clip_params = (attn_lwc_params + attn_lora_params) if stage1_update_attn else []
+        moe_clip_params = dedupe_parameters(stage1_attn_clip_params + moe_lwc_params + moe_lora_params)
         for epoch in range(args.epochs):
             loss_list = []
             norm_list = []
@@ -1292,6 +1373,7 @@ def train_decoupled_moe_layer(
                 smooth_is_llama=True,
                 update_epochs=update_stage_epochs,
                 clip_grad=clip_grad_max_norm,
+                aux_use_kl=getattr(args, "stage3_aux_loss_use_kl", False),
             )
 
             del update_optimizer
@@ -1434,8 +1516,12 @@ def omniquant(
     
     
     layers[0] = layers[0].to(dev)
-    attn_epochs = get_attention_epochs(args)
-    has_any_training_epochs = args.epochs > 0 or attn_epochs > 0
+    has_any_training_epochs = (
+        args.epochs > 0
+        or (getattr(args, "stage0_attn_epochs", 0) > 0)
+        or (getattr(args, "stage2_enable_calibration", False) and getattr(args, "stage2_router_epochs", 0) > 0)
+        or (getattr(args, "stage3_enable_block_update", False) and getattr(args, "stage3_block_update_epochs", 0) > 0)
+    )
     amp_enabled = not (args.deactive_amp and has_any_training_epochs)
     if amp_enabled:
         amp_dtype = torch.bfloat16 if all_cuda_devices_support_bf16() else torch.float16
@@ -1608,17 +1694,20 @@ def omniquant(
             and hasattr(layer, "mlp")
             and get_moe_experts_module(layer.mlp) is not None
         )
-        layer_attn_epochs = get_attention_epochs(args, i)
         stage2_calibration_enabled = (
             use_decoupled_moe_training
-            and getattr(args, "enable_expert_shift_calibration", False)
-            and getattr(args, "router_epochs", 0) > 0
+            and getattr(args, "stage2_enable_calibration", False)
+            and getattr(args, "stage2_router_epochs", 0) > 0
+        )
+        stage0_attn_enabled = (
+            use_decoupled_moe_training
+            and getattr(args, "stage0_attn_epochs", 0) > 0
         )
         base_train_current_layer = (
-            args.epochs > 0 
-            or (use_decoupled_moe_training and layer_attn_epochs > 0)
+            args.epochs > 0
+            or stage0_attn_enabled
             or stage2_calibration_enabled
-            or (getattr(args, "enable_block_loss_update", False) and getattr(args, "block_update_epochs", 0) > 0)
+            or (getattr(args, "stage3_enable_block_update", False) and getattr(args, "stage3_block_update_epochs", 0) > 0)
         )
         train_current_layer = base_train_current_layer
 
@@ -2033,8 +2122,12 @@ def omniquant(
                             if args.aug_loss:
                                 loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
                         if not math.isfinite(loss.item()):
-                            logger.info("Loss is NAN, stopping training")
-                            pdb.set_trace()
+                            message = (
+                                f"Non-finite reconstruction loss at layer={i}, "
+                                f"epoch={epochs}, batch={j}: {loss.item()}"
+                            )
+                            logger.error(message)
+                            raise FloatingPointError(message)
                             
                         loss_list.append(loss.detach().cpu())
                         optimizer.zero_grad()
@@ -2374,4 +2467,3 @@ def omniquant(
         log_decoupled_expert_shift_visualization(wandb, logger, decoupled_expert_shift_data)
     
     return model, final_loss
-

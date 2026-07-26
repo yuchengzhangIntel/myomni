@@ -6,6 +6,7 @@ from quantize.utils import (
     call_layer_forward,
     capture_router_labels_layerwise,
     clear_temp_variable,
+    compute_topk_kl_loss,
     compute_topk_mse_loss,
     extract_hidden_states,
     set_quant_state,
@@ -243,6 +244,7 @@ def update_block_parameters_with_loss(
     smooth_is_llama,
     update_epochs,
     clip_grad=None,
+    aux_use_kl=True,
 ):
     """
     Update selected parameters with block-wise loss.
@@ -300,7 +302,8 @@ def update_block_parameters_with_loss(
                             if aligned_router_logits is None:
                                 skipped_aux_missing_alignment += 1
                             else:
-                                aux_loss_value = compute_topk_mse_loss(
+                                aux_loss_fn = compute_topk_kl_loss if aux_use_kl else compute_topk_mse_loss
+                                aux_loss_value = aux_loss_fn(
                                     aligned_router_logits.float(),
                                     teacher_logits,
                                     teacher_indices,
@@ -311,7 +314,20 @@ def update_block_parameters_with_loss(
                                 else:
                                     aux_loss = aux_loss_value
 
-                    total_loss = main_loss + aug_loss + (aux_weight * aux_loss)
+                    # Scale the auxiliary router loss relative to the block
+                    # reconstruction loss. main_loss spans several orders of
+                    # magnitude across layers (~1e-5 shallow to ~0.6 deep) while
+                    # the router KL/MSE lives in an unrelated space, so a fixed
+                    # raw weight cannot stay balanced. We rescale aux so its
+                    # numeric contribution tracks aux_weight*main, then clamp the
+                    # scale at 1.0 so aux can never dominate main and a tiny aux
+                    # (already-aligned router) cannot blow up its gradient.
+                    aux_term = aux_loss
+                    if aux_enabled and aux_weight > 0:
+                        aux_denom = aux_loss.detach().clamp_min(1e-8)
+                        scale = (main_loss.detach() / aux_denom).clamp(max=1.0)
+                        aux_term = aux_loss * scale
+                    total_loss = main_loss + aug_loss + (aux_weight * aux_term)
 
                 norm, skipped_update, skip_reason = loss_scaler(
                     total_loss,
@@ -392,5 +408,4 @@ def _forward_with_router_logits(layer, hidden_states, layer_kwargs=None, **kwarg
             handle.remove()
 
     return extract_hidden_states(outputs), captured.get("logits")
-
 

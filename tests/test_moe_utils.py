@@ -28,9 +28,9 @@ from quantize.omniquant import (  # noqa: E402
     build_block_update_param_groups,
     build_router_calibration_param_groups,
     compute_moe_self_supervision_loss,
-    get_attention_epochs,
     should_keep_layer_full_precision,
     train_decoupled_moe_layer,
+    train_stage0_attention_alignment,
 )
 
 
@@ -187,16 +187,6 @@ def test_compute_expert_down_proj_output_supports_modulelist_experts():
     expected = experts[1](hidden_states)
 
     assert torch.allclose(actual, expected, atol=1e-6)
-
-
-def test_get_attention_epochs_defaults_to_global_epochs_and_allows_override():
-    assert get_attention_epochs(SimpleNamespace(epochs=12)) == 12
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3)) == 3
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=0) == 3
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=1) == 3
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=2) == 4
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=3), layer_idx=5) == 5
-    assert get_attention_epochs(SimpleNamespace(epochs=12, attn_epochs=0), layer_idx=6) == 0
 
 
 def test_moe_self_supervision_loss_handles_experts_and_shared_expert():
@@ -535,15 +525,15 @@ def test_build_block_update_param_groups_respects_scope_flags():
         wd=0.01,
         gate_lora_lr=2e-4,
         shared_gate_lr=3e-4,
-        block_update_attn=False,
-        block_update_router=False,
+        stage3_update_attn=False,
+        stage3_update_router=False,
     )
 
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     assert selected_params == []
     assert param_groups == []
 
-    args.block_update_attn = True
+    args.stage3_update_attn = True
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     selected_ids = {id(param) for param in selected_params}
     assert id(qlayer.self_attn.q_proj.bound_factor) in selected_ids
@@ -552,8 +542,8 @@ def test_build_block_update_param_groups_respects_scope_flags():
     assert id(qlayer.mlp.gate.weight) not in selected_ids
     assert len(param_groups) == 2
 
-    args.block_update_attn = False
-    args.block_update_router = True
+    args.stage3_update_attn = False
+    args.stage3_update_router = True
     selected_params, param_groups = build_block_update_param_groups(qlayer, args)
     selected_ids = {id(param) for param in selected_params}
     assert id(qlayer.self_attn.q_proj.bound_factor) not in selected_ids
@@ -581,11 +571,11 @@ def test_build_router_calibration_param_groups_respects_attention_flag():
     qlayer = FakeLayer()
     args = SimpleNamespace(
         use_linear_lora=True,
-        router_lr=1e-3,
+        stage2_router_lr=1e-3,
         lwc_lr=1e-2,
         linear_lora_lr=1e-4,
         wd=0.01,
-        expert_shift_calibration_update_attn=False,
+        stage2_update_attn=False,
     )
 
     selected_params, param_groups = build_router_calibration_param_groups(qlayer, args)
@@ -594,7 +584,7 @@ def test_build_router_calibration_param_groups_respects_attention_flag():
     assert id(qlayer.self_attn.q_proj.bound_factor) not in selected_ids
     assert len(param_groups) == 1
 
-    args.expert_shift_calibration_update_attn = True
+    args.stage2_update_attn = True
     selected_params, param_groups = build_router_calibration_param_groups(qlayer, args)
     selected_ids = {id(param) for param in selected_params}
     assert id(qlayer.mlp.gate.weight) in selected_ids
@@ -602,6 +592,94 @@ def test_build_router_calibration_param_groups_respects_attention_flag():
     assert id(qlayer.self_attn.q_proj.lora_A) in selected_ids
     assert id(qlayer.self_attn.q_proj.lora_B) in selected_ids
     assert len(param_groups) == 3
+
+
+def test_train_stage0_attention_alignment_updates_only_attention():
+    class DummyLogger:
+        def info(self, *_args, **_kwargs):
+            return None
+
+        def warning(self, *_args, **_kwargs):
+            return None
+
+    class DummyAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(0.5))
+
+        def forward(self, hidden_states, **kwargs):
+            # Quantized attention output depends on the trainable bound_factor so
+            # the alignment loss has a real gradient w.r.t. attention params.
+            return hidden_states + self.bound_factor
+
+    class DummyMLPExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bound_factor = nn.Parameter(torch.tensor(0.0))
+
+    class DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Identity()
+            self.post_attention_layernorm = nn.Identity()
+            self.self_attn = DummyAttn()
+            self.mlp = nn.Module()
+            self.mlp.experts = DummyMLPExpert()
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    # FP teacher path: attention contributes 0.5 to the residual MLP input.
+    layer = DummyLayer()
+    qlayer = DummyLayer()
+    qlayer.self_attn.bound_factor.data.fill_(0.0)
+
+    args = SimpleNamespace(
+        nsamples=2,
+        batch_size=1,
+        lwc_lr=1e-1,
+        linear_lora_lr=1e-4,
+        wd=0.0,
+        max_grad_norm=None,
+        use_linear_lora=False,
+        stage0_attn_epochs=3,
+    )
+
+    original_smooth = omniquant_module.smooth_and_quant_temporary
+    original_clear = omniquant_module.clear_temp_variable
+    original_set_quant = omniquant_module.set_quant_state
+    try:
+        omniquant_module.smooth_and_quant_temporary = lambda *a, **k: None
+        omniquant_module.clear_temp_variable = lambda *a, **k: None
+        omniquant_module.set_quant_state = lambda *a, **k: None
+
+        # stage0 disabled -> returns None, no updates
+        args.stage0_attn_epochs = 0
+        assert train_stage0_attention_alignment(
+            layer, qlayer, args, DummyLogger(), 0,
+            torch.zeros(2, 1, 1), torch.zeros(2, 1, 1),
+            {}, None, None, None, nullcontext, False,
+        ) is None
+
+        # stage0 enabled -> trains attn toward FP target (0.5), expert stays frozen
+        args.stage0_attn_epochs = 3
+        expert_before = qlayer.mlp.experts.bound_factor.detach().clone()
+        loss = train_stage0_attention_alignment(
+            layer, qlayer, args, DummyLogger(), 0,
+            torch.zeros(2, 1, 1), torch.zeros(2, 1, 1),
+            {}, None, None, None, nullcontext, False,
+        )
+        assert loss is not None
+        # attention param moved toward the FP attention output (0.5)
+        assert qlayer.self_attn.bound_factor.item() > 0.0
+        # expert param untouched
+        assert torch.equal(qlayer.mlp.experts.bound_factor.detach(), expert_before)
+        # requires_grad restored after stage0
+        assert qlayer.mlp.experts.bound_factor.requires_grad
+    finally:
+        omniquant_module.smooth_and_quant_temporary = original_smooth
+        omniquant_module.clear_temp_variable = original_clear
+        omniquant_module.set_quant_state = original_set_quant
 
 
 def test_evaluate_block_loss_modes_reports_student_only():
@@ -775,124 +853,6 @@ def test_native_scaler_updates_grad_scaler_state_when_large_grad_skips_step():
         root_utils_module.ampscaler_get_grad_norm = original_get_grad_norm
 
 
-def test_train_decoupled_moe_layer_clears_temp_weights_when_attention_stage_raises():
-    class DummyLogger:
-        def __init__(self):
-            self.infos = []
-            self.warnings = []
-
-        def info(self, message, *args, **kwargs):
-            self.infos.append(message)
-
-        def warning(self, message, *args, **kwargs):
-            self.warnings.append(message)
-
-    class DummyGate(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(1, 1))
-            self.top_k = 1
-            self.out_features = 1
-
-        def forward(self, hidden_states):
-            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-            logits = torch.ones(flat.shape[0], self.out_features, device=hidden_states.device)
-            return logits, logits, torch.zeros(flat.shape[0], 1, dtype=torch.long, device=hidden_states.device)
-
-    class DummyQuantModule(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.bound_factor = nn.Parameter(torch.tensor(0.0))
-
-        def forward(self, hidden_states, **kwargs):
-            return hidden_states
-
-    class DummyLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.input_layernorm = nn.Identity()
-            self.post_attention_layernorm = nn.Identity()
-            self.self_attn = nn.Module()
-            self.self_attn.q_proj = DummyQuantModule()
-            self.mlp = nn.Module()
-            self.mlp.gate = DummyGate()
-            self.mlp.experts = DummyQuantModule()
-
-        def forward(self, hidden_states, **kwargs):
-            return hidden_states
-
-    class RaisingScaler:
-        def __call__(self, *args, **kwargs):
-            raise RuntimeError("attention backward failed")
-
-    events = []
-    original_scaler_cls = omniquant_module.utils.NativeScalerWithGradNormCount
-    original_capture_teacher_router_labels = omniquant_module.capture_teacher_router_labels
-    original_compute_attention_outputs = omniquant_module.compute_attention_outputs
-    original_smooth_and_quant_temporary = omniquant_module.smooth_and_quant_temporary
-    original_clear_temp_variable = omniquant_module.clear_temp_variable
-    try:
-        omniquant_module.utils.NativeScalerWithGradNormCount = lambda *args, **kwargs: RaisingScaler()
-        omniquant_module.capture_teacher_router_labels = lambda *args, **kwargs: None
-        omniquant_module.smooth_and_quant_temporary = lambda *args, **kwargs: events.append("smooth")
-        omniquant_module.clear_temp_variable = lambda *args, **kwargs: events.append("clear")
-
-        layer = DummyLayer()
-        qlayer = DummyLayer()
-
-        def fake_compute_attention_outputs(current_layer, hidden_states, *args, **kwargs):
-            if current_layer is qlayer:
-                return hidden_states + current_layer.self_attn.q_proj.bound_factor
-            return torch.zeros_like(hidden_states)
-
-        omniquant_module.compute_attention_outputs = fake_compute_attention_outputs
-
-        args = SimpleNamespace(
-            let=False,
-            nsamples=1,
-            batch_size=1,
-            epochs=0,
-            attn_epochs=1,
-            lwc_lr=1e-2,
-            linear_lora_lr=1e-4,
-            wd=0.0,
-            max_grad_norm=None,
-            use_linear_lora=False,
-            enable_expert_shift_calibration=False,
-            enable_block_loss_update=False,
-            block_aux_loss=False,
-            k_loss=1,
-            k_routing=1,
-        )
-
-        with pytest.raises(RuntimeError, match="attention backward failed"):
-            train_decoupled_moe_layer(
-                layer=layer,
-                qlayer=qlayer,
-                args=args,
-                logger=DummyLogger(),
-                layer_idx=0,
-                fp_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
-                quant_inps=torch.zeros(1, 1, 1, dtype=torch.float32),
-                layer_kwargs={},
-                attention_mask_batch=None,
-                attention_mask=None,
-                position_ids=None,
-                traincast=nullcontext,
-                use_grad_scaler=False,
-                quant_routing_top_n=1,
-                use_router_weight_in_loss=False,
-            )
-
-        assert events == ["smooth", "clear"]
-    finally:
-        omniquant_module.utils.NativeScalerWithGradNormCount = original_scaler_cls
-        omniquant_module.capture_teacher_router_labels = original_capture_teacher_router_labels
-        omniquant_module.compute_attention_outputs = original_compute_attention_outputs
-        omniquant_module.smooth_and_quant_temporary = original_smooth_and_quant_temporary
-        omniquant_module.clear_temp_variable = original_clear_temp_variable
-
-
 def test_train_decoupled_moe_layer_clears_temp_weights_when_moe_stage_raises():
     class DummyLogger:
         def __init__(self):
@@ -971,15 +931,16 @@ def test_train_decoupled_moe_layer_clears_temp_weights_when_moe_stage_raises():
             nsamples=1,
             batch_size=1,
             epochs=1,
-            attn_epochs=0,
             lwc_lr=1e-2,
             linear_lora_lr=1e-4,
             wd=0.0,
             max_grad_norm=None,
             use_linear_lora=False,
-            enable_expert_shift_calibration=False,
-            enable_block_loss_update=False,
-            block_aux_loss=False,
+            stage0_attn_epochs=0,
+            stage1_update_attn=True,
+            stage2_enable_calibration=False,
+            stage3_enable_block_update=False,
+            stage3_aux_loss=False,
             k_loss=1,
             k_routing=1,
             aug_loss=False,
@@ -1128,24 +1089,25 @@ def test_train_decoupled_moe_layer_tracks_stages_and_releases_label_cache_early(
             nsamples=2,
             batch_size=1,
             epochs=4,
-            attn_epochs=0,
             lwc_lr=1e-2,
             linear_lora_lr=1e-4,
             wd=0.0,
             max_grad_norm=None,
             use_linear_lora=False,
-            enable_expert_shift_calibration=True,
-            router_epochs=1,
-            router_lr=1e-3,
-            expert_shift_calibration_update_attn=False,
-            expert_shift_calibration_use_kl=False,
-            enable_block_loss_update=True,
-            block_update_epochs=1,
-            block_update_attn=True,
-            block_update_router=False,
-            block_update_expert=False,
-            block_aux_loss=False,
-            block_aux_loss_weight=0.1,
+            stage0_attn_epochs=0,
+            stage1_update_attn=True,
+            stage2_enable_calibration=True,
+            stage2_router_epochs=1,
+            stage2_router_lr=1e-3,
+            stage2_update_attn=False,
+            stage2_use_kl=False,
+            stage3_enable_block_update=True,
+            stage3_block_update_epochs=1,
+            stage3_update_attn=True,
+            stage3_update_router=False,
+            stage3_update_expert=False,
+            stage3_aux_loss=False,
+            stage3_aux_loss_weight=0.1,
             block_eval_interval=2,
             k_loss=2,
             k_routing=2,

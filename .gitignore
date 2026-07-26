@@ -19,3 +19,9 @@ act_shifts/
 pre_quantized_models/
 temp.sh
 
+scripts/stage0_smoke/
+scripts/qwen/logs/
+scripts/qwen/*/cache/
+tests/stage0_smoke/*.log
+tests/stage0_smoke/*.pth
+tests/stage0_smoke/cache/
